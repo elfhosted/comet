@@ -1,12 +1,9 @@
-import contextlib
+# main.py
 import signal
 import sys
-import threading
-import time
-import traceback
 from contextlib import asynccontextmanager
+import time
 
-import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -18,7 +15,6 @@ from comet.api.stream import streams
 from comet.utils.db import setup_database, teardown_database
 from comet.utils.logger import logger
 from comet.utils.models import settings
-
 
 class LoguruMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -36,82 +32,39 @@ class LoguruMiddleware(BaseHTTPMiddleware):
             )
         return response
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await setup_database()
     yield
     await teardown_database()
 
+def create_app():
+    app = FastAPI(
+        title="Comet",
+        summary="Stremio torrent/debrid search add-on.",
+        version="1.0.0",
+        lifespan=lifespan,
+        redoc_url=None,
+    )
 
-app = FastAPI(
-    title="Comet",
-    summary="Stremio's fastest torrent/debrid search add-on.",
-    version="1.0.0",
-    lifespan=lifespan,
-    redoc_url=None,
-)
+    app.add_middleware(LoguruMiddleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
+    app.mount("/static", StaticFiles(directory="comet/templates"), name="static")
+    app.include_router(main)
+    app.include_router(streams)
 
-app.add_middleware(LoguruMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    return app
 
-app.mount("/static", StaticFiles(directory="comet/templates"), name="static")
+app = create_app()
 
-app.include_router(main)
-app.include_router(streams)
-
-
-class Server(uvicorn.Server):
-    def install_signal_handlers(self):
-        pass
-
-    @contextlib.contextmanager
-    def run_in_thread(self):
-        thread = threading.Thread(target=self.run, name="Comet")
-        thread.start()
-        try:
-            while not self.started:
-                time.sleep(1e-3)
-            yield
-        except Exception as e:
-            logger.error(f"Error in server thread: {e}")
-            logger.exception(traceback.format_exc())
-            raise e
-        finally:
-            self.should_exit = True
-            sys.exit(0)
-
-
-def signal_handler(sig, frame):
-    # This will handle kubernetes/docker shutdowns better
-    # Toss anything that needs to be gracefully shutdown here
-    logger.log("COMET", "Exiting Gracefully.")
-    sys.exit(0)
-
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-config = uvicorn.Config(
-    app,
-    host=settings.FASTAPI_HOST,
-    port=settings.FASTAPI_PORT,
-    proxy_headers=True,
-    forwarded_allow_ips="*",
-    workers=settings.FASTAPI_WORKERS,
-    log_config=None,
-)
-server = Server(config=config)
-
-
-def start_log():
+def log_startup_info():
     logger.log(
         "COMET",
         f"Server started on http://{settings.FASTAPI_HOST}:{settings.FASTAPI_PORT} - {settings.FASTAPI_WORKERS} workers",
@@ -160,16 +113,14 @@ def start_log():
     logger.log("COMET", f"Remove Adult Content: {bool(settings.REMOVE_ADULT_CONTENT)}")
     logger.log("COMET", f"Custom Header HTML: {bool(settings.CUSTOM_HEADER_HTML)}")
 
-
-with server.run_in_thread():
-    start_log()
-    try:
-        while True:
-            time.sleep(1)  # Keep the main thread alive
-    except KeyboardInterrupt:
-        logger.log("COMET", "Server stopped by user")
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        logger.exception(traceback.format_exc())
-    finally:
-        logger.log("COMET", "Server Shutdown")
+# For development server
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host=settings.FASTAPI_HOST,
+        port=settings.FASTAPI_PORT,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+        workers=settings.FASTAPI_WORKERS,
+    )

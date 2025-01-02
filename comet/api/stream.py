@@ -147,7 +147,7 @@ async def stream(
             config["debridApiKey"] = settings.PROXY_DEBRID_STREAM_DEBRID_DEFAULT_APIKEY
 
         if config["debridApiKey"] == "":
-            services = ["realdebrid", "alldebrid", "premiumize", "torbox", "debridlink"]
+            services = ["realdebrid", "alldebrid", "premiumize", "torbox", "debridlink", "easydebrid"]
             debrid_emoji = "⬇️"
         else:
             services = [config["debridService"]]
@@ -462,6 +462,10 @@ async def stream(
             torrent_size = torrents_by_hash[hash]["Size"]
             sorted_ranked_files[hash]["data"]["size"] = (
                 files[hash]["size"]
+                if config["debridService"] != "easydebrid"
+                else torrent_size
+                if torrent_size
+                else 0                
             )
             sorted_ranked_files[hash]["data"]["torrent_size"] = (
                 torrent_size if torrent_size else files[hash]["size"]
