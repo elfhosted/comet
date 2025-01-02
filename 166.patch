@@ -1,0 +1,846 @@
+From d1dfdf20691c4998d19623cd2f1e6c55ca1407b5 Mon Sep 17 00:00:00 2001
+From: Munif Tanjim <hello@muniftanjim.dev>
+Date: Wed, 30 Oct 2024 11:28:53 +0600
+Subject: [PATCH 1/5] feat(debrid): add support for stremthru
+
+---
+ .env-sample                |   1 +
+ README.md                  |   1 +
+ comet/api/core.py          |   1 +
+ comet/api/stream.py        |  47 ++++------
+ comet/debrid/manager.py    |  12 +++
+ comet/debrid/stremthru.py  | 174 +++++++++++++++++++++++++++++++++++++
+ comet/main.py              |   2 +
+ comet/templates/index.html |  11 +++
+ comet/utils/config.py      |  40 +++++++++
+ comet/utils/general.py     |   1 +
+ comet/utils/models.py      |   4 +-
+ 11 files changed, 261 insertions(+), 33 deletions(-)
+ create mode 100644 comet/debrid/stremthru.py
+ create mode 100644 comet/utils/config.py
+
+diff --git a/.env-sample b/.env-sample
+index a6bf81a..d438da7 100644
+--- a/.env-sample
++++ b/.env-sample
+@@ -27,4 +27,5 @@ PROXY_DEBRID_STREAM_DEBRID_DEFAULT_SERVICE=realdebrid # if you want your users w
+ PROXY_DEBRID_STREAM_DEBRID_DEFAULT_APIKEY=CHANGE_ME # if you want your users who use the Debrid Stream Proxy not to have to specify Debrid information, but to use the default one instead
+ TITLE_MATCH_CHECK=True # disable if you only use Torrentio / MediaFusion and are sure you're only scraping good titles, for example (keep it True if Zilean is enabled)
+ REMOVE_ADULT_CONTENT=False # detect and remove adult content
++STREMTHRU_DEFAULT_URL=None # if you want your users to use StremThru without having to specify it
+ CUSTOM_HEADER_HTML=None # only set it if you know what it is
+diff --git a/README.md b/README.md
+index 3ed4a4e..47f92aa 100644
+--- a/README.md
++++ b/README.md
+@@ -20,6 +20,7 @@
+ - Direct Torrent supported (do not specify a Debrid API Key on the configuration page (webui) to activate it - it will use the cached results of other users using debrid service)
+ - [Kitsu](https://kitsu.io/) support (anime)
+ - Adult Content Filter
++- [StremThru](https://github.com/MunifTanjim/stremthru) support
+ 
+ # Installation
+ To customize your Comet experience to suit your needs, please first take a look at all the [environment variables](https://github.com/g0ldyy/comet/blob/main/.env-sample)!
+diff --git a/comet/api/core.py b/comet/api/core.py
+index dc7b458..16e2b7b 100644
+--- a/comet/api/core.py
++++ b/comet/api/core.py
+@@ -49,6 +49,7 @@ async def configure(request: Request):
+             "webConfig": web_config,
+             "indexerManager": settings.INDEXER_MANAGER_TYPE,
+             "proxyDebridStream": settings.PROXY_DEBRID_STREAM,
++            "stremthruDefaultUrl": settings.STREMTHRU_DEFAULT_URL or "",
+         },
+     )
+ 
+diff --git a/comet/api/stream.py b/comet/api/stream.py
+index 53bcd92..fe38073 100644
+--- a/comet/api/stream.py
++++ b/comet/api/stream.py
+@@ -32,6 +32,7 @@
+     get_aliases,
+     add_torrent_to_cache,
+ )
++from comet.utils.config import is_proxy_stream_authed, is_proxy_stream_enabled, prepare_debrid_config, should_skip_proxy_stream
+ from comet.utils.logger import logger
+ from comet.utils.models import database, rtn, settings, trackers
+ 
+@@ -135,19 +136,10 @@ async def stream(
+         if type == "series":
+             log_name = f"{name} S{season:02d}E{episode:02d}"
+ 
+-        if (
+-            settings.PROXY_DEBRID_STREAM
+-            and settings.PROXY_DEBRID_STREAM_PASSWORD
+-            == config["debridStreamProxyPassword"]
+-            and config["debridApiKey"] == ""
+-        ):
+-            config["debridService"] = (
+-                settings.PROXY_DEBRID_STREAM_DEBRID_DEFAULT_SERVICE
+-            )
+-            config["debridApiKey"] = settings.PROXY_DEBRID_STREAM_DEBRID_DEFAULT_APIKEY
++        prepare_debrid_config(config)
+ 
+         if config["debridApiKey"] == "":
+-            services = ["realdebrid", "alldebrid", "premiumize", "torbox", "debridlink"]
++            services = ["realdebrid", "alldebrid", "premiumize", "torbox", "debridlink", "stremthru"]
+             debrid_emoji = "⬇️"
+         else:
+             services = [config["debridService"]]
+@@ -155,10 +147,8 @@ async def stream(
+ 
+         results = []
+         if (
+-            config["debridStreamProxyPassword"] != ""
+-            and settings.PROXY_DEBRID_STREAM
+-            and settings.PROXY_DEBRID_STREAM_PASSWORD
+-            != config["debridStreamProxyPassword"]
++            is_proxy_stream_enabled(config)
++            and not is_proxy_stream_authed(config)
+         ):
+             results.append(
+                 {
+@@ -480,10 +470,8 @@ async def stream(
+ 
+         results = []
+         if (
+-            config["debridStreamProxyPassword"] != ""
+-            and settings.PROXY_DEBRID_STREAM
+-            and settings.PROXY_DEBRID_STREAM_PASSWORD
+-            != config["debridStreamProxyPassword"]
++            is_proxy_stream_enabled(config)
++            and not is_proxy_stream_authed(config)
+         ):
+             results.append(
+                 {
+@@ -545,13 +533,7 @@ async def playback(request: Request, b64config: str, hash: str, index: str):
+     if not config:
+         return FileResponse("comet/assets/invalidconfig.mp4")
+ 
+-    if (
+-        settings.PROXY_DEBRID_STREAM
+-        and settings.PROXY_DEBRID_STREAM_PASSWORD == config["debridStreamProxyPassword"]
+-        and config["debridApiKey"] == ""
+-    ):
+-        config["debridService"] = settings.PROXY_DEBRID_STREAM_DEBRID_DEFAULT_SERVICE
+-        config["debridApiKey"] = settings.PROXY_DEBRID_STREAM_DEBRID_DEFAULT_APIKEY
++    prepare_debrid_config(config)
+ 
+     async with aiohttp.ClientSession(raise_for_status=True) as session:
+         # Check for cached download link
+@@ -581,9 +563,8 @@ async def playback(request: Request, b64config: str, hash: str, index: str):
+                 config,
+                 ip
+                 if (
+-                    not settings.PROXY_DEBRID_STREAM
+-                    or settings.PROXY_DEBRID_STREAM_PASSWORD
+-                    != config["debridStreamProxyPassword"]
++                    not is_proxy_stream_enabled(config)
++                    or not is_proxy_stream_authed(config)
+                 )
+                 else "",
+             )
+@@ -603,10 +584,12 @@ async def playback(request: Request, b64config: str, hash: str, index: str):
+                 },
+             )
+ 
++        if should_skip_proxy_stream(config):
++            return RedirectResponse(download_link, status_code=302)
++
+         if (
+-            settings.PROXY_DEBRID_STREAM
+-            and settings.PROXY_DEBRID_STREAM_PASSWORD
+-            == config["debridStreamProxyPassword"]
++            is_proxy_stream_enabled(config)
++            and is_proxy_stream_authed(config)
+         ):
+             if settings.PROXY_DEBRID_STREAM_MAX_CONNECTIONS != -1:
+                 active_ip_connections = await database.fetch_all(
+diff --git a/comet/debrid/manager.py b/comet/debrid/manager.py
+index cbcc5ed..ccea812 100644
+--- a/comet/debrid/manager.py
++++ b/comet/debrid/manager.py
+@@ -1,15 +1,27 @@
+ import aiohttp
+ 
++from comet.utils.config import should_use_stremthru
++
+ from .realdebrid import RealDebrid
+ from .alldebrid import AllDebrid
+ from .premiumize import Premiumize
+ from .torbox import TorBox
+ from .debridlink import DebridLink
++from .stremthru import StremThru
+ 
+ 
+ def getDebrid(session: aiohttp.ClientSession, config: dict, ip: str):
+     debrid_service = config["debridService"]
+     debrid_api_key = config["debridApiKey"]
++
++    if should_use_stremthru(config):
++        return StremThru(
++            session=session,
++            url=config["stremthruUrl"],
++            debrid_service=debrid_service,
++            token=debrid_api_key,
++        )
++
+     if debrid_service == "realdebrid":
+         return RealDebrid(session, debrid_api_key, ip)
+     elif debrid_service == "alldebrid":
+diff --git a/comet/debrid/stremthru.py b/comet/debrid/stremthru.py
+new file mode 100644
+index 0000000..7762a5d
+--- /dev/null
++++ b/comet/debrid/stremthru.py
+@@ -0,0 +1,174 @@
++import asyncio
++from typing import Optional
++
++import aiohttp
++from RTN import parse
++
++from comet.utils.general import is_video
++from comet.utils.logger import logger
++
++
++class StremThru:
++    def __init__(
++        self,
++        session: aiohttp.ClientSession,
++        url: str,
++        token: str,
++        debrid_service: str,
++    ):
++        if not self.is_supported_store(debrid_service):
++            raise ValueError(f"unsupported store: {debrid_service}")
++
++        if debrid_service == "stremthru":
++            session.headers["Proxy-Authorization"] = f"Basic {token}"
++        else:
++            session.headers["X-StremThru-Store-Name"] = debrid_service
++            session.headers["X-StremThru-Store-Authorization"] = f"Bearer {token}"
++
++        session.headers["User-Agent"] = "comet"
++
++        self.session = session
++        self.base_url = f"{url}/v0/store"
++        self.name = f"StremThru[{debrid_service}]" if debrid_service else "StremThru"
++
++    @staticmethod
++    def is_supported_store(name: Optional[str]):
++        return (
++            name == "stremthru"
++            or name == "alldebrid"
++            or name == "debridlink"
++            or name == "premiumize"
++            or name == "realdebrid"
++            or name == "torbox"
++        )
++
++    async def check_premium(self):
++        try:
++            user = await self.session.get(f"{self.base_url}/user")
++            user = await user.json()
++            return user["data"]["subscription_status"] == "premium"
++        except Exception as e:
++            logger.warning(
++                f"Exception while checking premium status on {self.name}: {e}"
++            )
++
++        return False
++
++    async def get_instant(self, magnets: list):
++        try:
++            magnet = await self.session.get(
++                f"{self.base_url}/magnets/check?magnet={','.join(magnets)}"
++            )
++            return await magnet.json()
++        except Exception as e:
++            logger.warning(
++                f"Exception while checking hash instant availability on {self.name}: {e}"
++            )
++
++    async def get_files(
++        self, torrent_hashes: list, type: str, season: str, episode: str, kitsu: bool
++    ):
++        chunk_size = 25
++        chunks = [
++            torrent_hashes[i : i + chunk_size]
++            for i in range(0, len(torrent_hashes), chunk_size)
++        ]
++
++        tasks = []
++        for chunk in chunks:
++            tasks.append(self.get_instant(chunk))
++
++        responses = await asyncio.gather(*tasks)
++
++        availability = [
++            response["data"]["items"]
++            for response in responses
++            if response and "data" in response
++        ]
++
++        files = {}
++
++        if type == "series":
++            for magnets in availability:
++                for magnet in magnets:
++                    if magnet["status"] != "cached":
++                        continue
++
++                    for file in magnet["files"]:
++                        filename = file["name"]
++
++                        if not is_video(filename) or "sample" in filename:
++                            continue
++
++                        filename_parsed = parse(filename)
++
++                        if episode not in filename_parsed.episodes:
++                            continue
++
++                        if kitsu:
++                            if filename_parsed.seasons:
++                                continue
++                        else:
++                            if season not in filename_parsed.seasons:
++                                continue
++
++                        files[magnet["hash"]] = {
++                            "index": file["index"],
++                            "title": filename,
++                            "size": file["size"],
++                        }
++
++                        break
++        else:
++            for magnets in availability:
++                for magnet in magnets:
++                    if magnet["status"] != "cached":
++                        continue
++
++                    for file in magnet["files"]:
++                        filename = file["name"]
++
++                        if not is_video(filename) or "sample" in filename:
++                            continue
++
++                        files[magnet["hash"]] = {
++                            "index": file["index"],
++                            "title": filename,
++                            "size": file["size"],
++                        }
++
++                        break
++
++        return files
++
++    async def generate_download_link(self, hash: str, index: str):
++        try:
++            magnet = await self.session.post(
++                f"{self.base_url}/magnets",
++                json={"magnet": f"magnet:?xt=urn:btih:{hash}"},
++            )
++            magnet = await magnet.json()
++
++            file = next(
++                (
++                    file
++                    for file in magnet["data"]["files"]
++                    if file["index"] == int(index)
++                ),
++                None,
++            )
++
++            if not file:
++                return
++
++            link = await self.session.post(
++                f"{self.base_url}/link/generate",
++                json={"link": file["link"]},
++            )
++            link = await link.json()
++
++            return link["data"]["link"]
++        except Exception as e:
++            logger.warning(
++                f"Exception while getting download link from {self.name} for {hash}|{index}: {e}"
++            )
+diff --git a/comet/main.py b/comet/main.py
+index 4cccd79..7a732bc 100644
+--- a/comet/main.py
++++ b/comet/main.py
+@@ -156,6 +156,8 @@ def start_log():
+         "COMET",
+         f"Debrid Stream Proxy: {bool(settings.PROXY_DEBRID_STREAM)} - Password: {settings.PROXY_DEBRID_STREAM_PASSWORD} - Max Connections: {settings.PROXY_DEBRID_STREAM_MAX_CONNECTIONS} - Default Debrid Service: {settings.PROXY_DEBRID_STREAM_DEBRID_DEFAULT_SERVICE} - Default Debrid API Key: {settings.PROXY_DEBRID_STREAM_DEBRID_DEFAULT_APIKEY}",
+     )
++    if settings.STREMTHRU_DEFAULT_URL:
++        logger.log("COMET", f"Default StremThru URL: {settings.STREMTHRU_DEFAULT_URL}")
+     logger.log("COMET", f"Title Match Check: {bool(settings.TITLE_MATCH_CHECK)}")
+     logger.log("COMET", f"Remove Adult Content: {bool(settings.REMOVE_ADULT_CONTENT)}")
+     logger.log("COMET", f"Custom Header HTML: {bool(settings.CUSTOM_HEADER_HTML)}")
+diff --git a/comet/templates/index.html b/comet/templates/index.html
+index 75b6ccc..40d5773 100644
+--- a/comet/templates/index.html
++++ b/comet/templates/index.html
+@@ -546,6 +546,7 @@
+                     <sl-option value="alldebrid">All-Debrid</sl-option>
+                     <sl-option value="premiumize">Premiumize</sl-option>
+                     <sl-option value="realdebrid">Real-Debrid</sl-option>
++                    <sl-option value="stremthru">StremThru</sl-option>
+                 </sl-select>
+             </div>
+ 
+@@ -557,6 +558,10 @@
+                 <sl-input id="debridApiKey" placeholder="Enter API key" help-text="If no key is specified, you'll get direct torrents!"></sl-input>
+             </div>
+ 
++            <div class="form-item">
++                <sl-input id="stremthruUrl" label="StremThru URL" placeholder="{{stremthruDefaultUrl}}" help-text="URL for StremThru."></sl-input>
++            </div>
++
+             <sl-details summary="Advanced Settings">
+                 <div class="form-item">
+                     <sl-checkbox checked id="removeTrash" help-text="Remove all trash from results (Adult Content, CAM, Clean Audio, PDTV, R5, Screener, Size, Telecine and Telesync)">Remove Trash</sl-checkbox>
+@@ -581,6 +586,8 @@
+                         apiKeyLink.href = "https://torbox.app/settings";
+                     } else if (selectedService === "debridlink") {
+                         apiKeyLink.href = "https://debrid-link.com/webapp/apikey";
++                    } else if (selectedService === "stremthru") {
++                        apiKeyLink.href = "https://github.com/MunifTanjim/stremthru?tab=readme-ov-file#configuration";
+                     }
+                 });
+             </script>
+@@ -725,6 +732,7 @@
+                         const resultFormat = Array.from(document.getElementById("resultFormat").selectedOptions).map(option => option.value);
+                         const debridService = document.getElementById("debridService").value;
+                         const debridApiKey = document.getElementById("debridApiKey").value;
++                        const stremthruUrl = document.getElementById("stremthruUrl").value;
+                         const debridStreamProxyPassword = document.getElementById("debridStreamProxyPassword").value;
+                         const selectedLanguages = languages.length === defaultLanguages.length && languages.every((val, index) => val === defaultLanguages[index]) ? ["All"] : languages;
+                         const selectedResolutions = resolutions.length === defaultResolutions.length && resolutions.every((val, index) => val === defaultResolutions[index]) ? ["All"] : resolutions;
+@@ -742,6 +750,7 @@
+                             languages: selectedLanguages,
+                             debridService: debridService,
+                             debridApiKey: debridApiKey,
++                            stremthruUrl: stremthruUrl,
+                             debridStreamProxyPassword: debridStreamProxyPassword,
+                         };
+                     }
+@@ -807,6 +816,8 @@
+                             document.getElementById("indexers").value = settings.indexers;
+                         if (settings.languages !== null && settings.languages != "All")
+                             document.getElementById("languages").value = settings.languages;
++                        if (settings.stremthruUrl !== null)
++                          document.getElementById("stremthruUrl").value = settings.stremthruUrl;
+                         if (settings.resolutions !== null && settings.resolutions != "All")
+                             document.getElementById("resolutions").value = settings.resolutions;
+                         if (settings.resultFormat !== null && settings.resultFormat != "All")
+diff --git a/comet/utils/config.py b/comet/utils/config.py
+new file mode 100644
+index 0000000..f67e635
+--- /dev/null
++++ b/comet/utils/config.py
+@@ -0,0 +1,40 @@
++from typing import Any
++
++from comet.debrid.stremthru import StremThru
++from comet.utils.models import settings
++
++
++def is_proxy_stream_enabled(config: dict[str, Any]):
++    return (
++        bool(settings.PROXY_DEBRID_STREAM) and config["debridStreamProxyPassword"] != ""
++    )
++
++
++def is_proxy_stream_authed(config: dict[str, Any]):
++    return settings.PROXY_DEBRID_STREAM_PASSWORD == config["debridStreamProxyPassword"]
++
++
++def should_use_stremthru(config: dict[str, Any]):
++    return config["stremthruUrl"] and StremThru.is_supported_store(
++        config["debridService"]
++    )
++
++
++def should_skip_proxy_stream(config: dict[str, Any]):
++    return config["stremthruUrl"] and config["debridService"] == "stremthru"
++
++
++def should_use_fallback_debrid_config(config: dict[str, Any]):
++    if is_proxy_stream_authed(config) and config["debridApiKey"] == "":
++        return True
++
++    return False
++
++
++def prepare_debrid_config(config: dict[str, Any]):
++    if should_use_fallback_debrid_config(config):
++        config["debridService"] = settings.PROXY_DEBRID_STREAM_DEBRID_DEFAULT_SERVICE
++        config["debridApiKey"] = settings.PROXY_DEBRID_STREAM_DEBRID_DEFAULT_APIKEY
++
++    if not config["stremthruUrl"]:
++        config["stremthruUrl"] = settings.STREMTHRU_DEFAULT_URL
+diff --git a/comet/utils/general.py b/comet/utils/general.py
+index 2ad0b30..adf1f40 100644
+--- a/comet/utils/general.py
++++ b/comet/utils/general.py
+@@ -269,6 +269,7 @@ def get_debrid_extension(debridService: str, debridApiKey: str = None):
+         "premiumize": "PM",
+         "torbox": "TB",
+         "debridlink": "DL",
++        "stremthru": "ST",
+     }
+ 
+     return debrid_extensions.get(debridService, None)
+diff --git a/comet/utils/models.py b/comet/utils/models.py
+index 62cef9e..077e30a 100644
+--- a/comet/utils/models.py
++++ b/comet/utils/models.py
+@@ -42,6 +42,7 @@ class AppSettings(BaseSettings):
+     PROXY_DEBRID_STREAM_DEBRID_DEFAULT_APIKEY: Optional[str] = None
+     TITLE_MATCH_CHECK: Optional[bool] = True
+     REMOVE_ADULT_CONTENT: Optional[bool] = False
++    STREMTHRU_DEFAULT_URL: Optional[str] = None
+ 
+     @field_validator("DASHBOARD_ADMIN_PASSWORD")
+     def set_dashboard_admin_password(cls, v, values):
+@@ -78,6 +79,7 @@ class ConfigModel(BaseModel):
+     debridService: str
+     debridApiKey: str
+     debridStreamProxyPassword: Optional[str] = ""
++    stremthruUrl: Optional[str] = None
+ 
+     @field_validator("indexers")
+     def check_indexers(cls, v, values):
+@@ -123,7 +125,7 @@ def check_max_size(cls, v):
+ 
+     @field_validator("debridService")
+     def check_debrid_service(cls, v):
+-        if v not in ["realdebrid", "alldebrid", "premiumize", "torbox", "debridlink"]:
++        if v not in ["realdebrid", "alldebrid", "premiumize", "torbox", "debridlink", "stremthru"]:
+             raise ValueError("Invalid debridService")
+         return v
+ 
+
+From 1aba3082d8cbd933b2ec31a9f9a05dce8832f73f Mon Sep 17 00:00:00 2001
+From: Munif Tanjim <hello@muniftanjim.dev>
+Date: Sun, 1 Dec 2024 10:48:53 +0600
+Subject: [PATCH 2/5] fix(debrid/stremthru): handle missing file index
+
+---
+ comet/api/stream.py       | 6 +++++-
+ comet/debrid/stremthru.py | 5 ++++-
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/comet/api/stream.py b/comet/api/stream.py
+index fe38073..efdc8e2 100644
+--- a/comet/api/stream.py
++++ b/comet/api/stream.py
+@@ -484,13 +484,17 @@ async def stream(
+         for resolution in balanced_hashes:
+             for hash in balanced_hashes[resolution]:
+                 data = sorted_ranked_files[hash]["data"]
++                index = data['index']
++                if index == -1:
++                    index = data['title']
++                url = f"{request.url.scheme}://{request.url.netloc}/{b64config}/playback/{hash}/{index}"
+                 results.append(
+                     {
+                         "name": f"[{debrid_extension}⚡] Comet {data['resolution']}",
+                         "description": format_title(data, config),
+                         "torrentTitle": data["torrent_title"],
+                         "torrentSize": data["torrent_size"],
+-                        "url": f"{request.url.scheme}://{request.url.netloc}/{b64config}/playback/{hash}/{data['index']}",
++                        "url": url,
+                         "behaviorHints": {
+                             "filename": data["raw_title"],
+                             "bingeGroup": "comet|" + hash,
+diff --git a/comet/debrid/stremthru.py b/comet/debrid/stremthru.py
+index 7762a5d..b8e163e 100644
+--- a/comet/debrid/stremthru.py
++++ b/comet/debrid/stremthru.py
+@@ -149,11 +149,14 @@ async def generate_download_link(self, hash: str, index: str):
+             )
+             magnet = await magnet.json()
+ 
++            if magnet["data"]["status"] != "downloaded":
++                return
++
+             file = next(
+                 (
+                     file
+                     for file in magnet["data"]["files"]
+-                    if file["index"] == int(index)
++                    if str(file["index"]) == index or file["name"] == index
+                 ),
+                 None,
+             )
+
+From 05b5921cc84a74247ce9b1c4d092d5075c280ef0 Mon Sep 17 00:00:00 2001
+From: Munif Tanjim <hello@muniftanjim.dev>
+Date: Sat, 28 Dec 2024 17:29:02 +0600
+Subject: [PATCH 3/5] feat(debrid/stremthru): forward client ip
+
+---
+ comet/debrid/manager.py   |  1 +
+ comet/debrid/stremthru.py | 12 ++++++++----
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/comet/debrid/manager.py b/comet/debrid/manager.py
+index ccea812..3646dda 100644
+--- a/comet/debrid/manager.py
++++ b/comet/debrid/manager.py
+@@ -20,6 +20,7 @@ def getDebrid(session: aiohttp.ClientSession, config: dict, ip: str):
+             url=config["stremthruUrl"],
+             debrid_service=debrid_service,
+             token=debrid_api_key,
++            ip=ip,
+         )
+ 
+     if debrid_service == "realdebrid":
+diff --git a/comet/debrid/stremthru.py b/comet/debrid/stremthru.py
+index b8e163e..aebf4ff 100644
+--- a/comet/debrid/stremthru.py
++++ b/comet/debrid/stremthru.py
+@@ -15,6 +15,7 @@ def __init__(
+         url: str,
+         token: str,
+         debrid_service: str,
++        ip: str,
+     ):
+         if not self.is_supported_store(debrid_service):
+             raise ValueError(f"unsupported store: {debrid_service}")
+@@ -30,6 +31,7 @@ def __init__(
+         self.session = session
+         self.base_url = f"{url}/v0/store"
+         self.name = f"StremThru[{debrid_service}]" if debrid_service else "StremThru"
++        self.client_ip = ip
+ 
+     @staticmethod
+     def is_supported_store(name: Optional[str]):
+@@ -44,7 +46,9 @@ def is_supported_store(name: Optional[str]):
+ 
+     async def check_premium(self):
+         try:
+-            user = await self.session.get(f"{self.base_url}/user")
++            user = await self.session.get(
++                f"{self.base_url}/user?client_ip={self.client_ip}"
++            )
+             user = await user.json()
+             return user["data"]["subscription_status"] == "premium"
+         except Exception as e:
+@@ -57,7 +61,7 @@ async def check_premium(self):
+     async def get_instant(self, magnets: list):
+         try:
+             magnet = await self.session.get(
+-                f"{self.base_url}/magnets/check?magnet={','.join(magnets)}"
++                f"{self.base_url}/magnets/check?magnet={','.join(magnets)}&client_ip={self.client_ip}"
+             )
+             return await magnet.json()
+         except Exception as e:
+@@ -144,7 +148,7 @@ async def get_files(
+     async def generate_download_link(self, hash: str, index: str):
+         try:
+             magnet = await self.session.post(
+-                f"{self.base_url}/magnets",
++                f"{self.base_url}/magnets?client_ip={self.client_ip}",
+                 json={"magnet": f"magnet:?xt=urn:btih:{hash}"},
+             )
+             magnet = await magnet.json()
+@@ -165,7 +169,7 @@ async def generate_download_link(self, hash: str, index: str):
+                 return
+ 
+             link = await self.session.post(
+-                f"{self.base_url}/link/generate",
++                f"{self.base_url}/link/generate?client_ip={self.client_ip}",
+                 json={"link": file["link"]},
+             )
+             link = await link.json()
+
+From 04014cae09afe3c426ac32fc682619214f315c0a Mon Sep 17 00:00:00 2001
+From: Munif Tanjim <hello@muniftanjim.dev>
+Date: Sun, 29 Dec 2024 01:49:36 +0600
+Subject: [PATCH 4/5] feat(debrid/stremthru): use default url only for specific
+ services
+
+---
+ comet/utils/config.py | 5 ++++-
+ comet/utils/models.py | 7 ++++++-
+ 2 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/comet/utils/config.py b/comet/utils/config.py
+index f67e635..402efa9 100644
+--- a/comet/utils/config.py
++++ b/comet/utils/config.py
+@@ -36,5 +36,8 @@ def prepare_debrid_config(config: dict[str, Any]):
+         config["debridService"] = settings.PROXY_DEBRID_STREAM_DEBRID_DEFAULT_SERVICE
+         config["debridApiKey"] = settings.PROXY_DEBRID_STREAM_DEBRID_DEFAULT_APIKEY
+ 
+-    if not config["stremthruUrl"]:
++    if (
++        not config["stremthruUrl"]
++        and config["debridService"] in settings.STREMTHRU_AUTO_ENABLED_DEBRID_SERVICES
++    ):
+         config["stremthruUrl"] = settings.STREMTHRU_DEFAULT_URL
+diff --git a/comet/utils/models.py b/comet/utils/models.py
+index 077e30a..8e4e241 100644
+--- a/comet/utils/models.py
++++ b/comet/utils/models.py
+@@ -42,7 +42,12 @@ class AppSettings(BaseSettings):
+     PROXY_DEBRID_STREAM_DEBRID_DEFAULT_APIKEY: Optional[str] = None
+     TITLE_MATCH_CHECK: Optional[bool] = True
+     REMOVE_ADULT_CONTENT: Optional[bool] = False
+-    STREMTHRU_DEFAULT_URL: Optional[str] = None
++    STREMTHRU_DEFAULT_URL: Optional[str] = "https://stremthru.elfhosted.com"
++    STREMTHRU_AUTO_ENABLED_DEBRID_SERVICES: List[str] = [
++        "realdebrid",
++        "alldebrid",
++        "debridlink",
++    ]
+ 
+     @field_validator("DASHBOARD_ADMIN_PASSWORD")
+     def set_dashboard_admin_password(cls, v, values):
+
+From 4e4816405ce6ec6bd39746af0e703089a1f597f3 Mon Sep 17 00:00:00 2001
+From: Munif Tanjim <hello@muniftanjim.dev>
+Date: Tue, 31 Dec 2024 16:44:23 +0600
+Subject: [PATCH 5/5] feat(debrid/stremthru): pass stremio video id for magnet
+ cache check
+
+---
+ comet/api/stream.py        |  1 +
+ comet/debrid/alldebrid.py  |  2 +-
+ comet/debrid/debridlink.py |  2 +-
+ comet/debrid/premiumize.py |  2 +-
+ comet/debrid/realdebrid.py |  2 +-
+ comet/debrid/stremthru.py  | 20 ++++++++++++++------
+ comet/debrid/torbox.py     |  2 +-
+ 7 files changed, 20 insertions(+), 11 deletions(-)
+
+diff --git a/comet/api/stream.py b/comet/api/stream.py
+index efdc8e2..7dc5149 100644
+--- a/comet/api/stream.py
++++ b/comet/api/stream.py
+@@ -411,6 +411,7 @@ async def stream(
+             season,
+             episode,
+             kitsu,
++            video_id=full_id,
+         )
+ 
+         ranked_files = set()
+diff --git a/comet/debrid/alldebrid.py b/comet/debrid/alldebrid.py
+index 75a06e0..cb433a8 100644
+--- a/comet/debrid/alldebrid.py
++++ b/comet/debrid/alldebrid.py
+@@ -44,7 +44,7 @@ async def get_instant(self, chunk: list):
+             )
+ 
+     async def get_files(
+-        self, torrent_hashes: list, type: str, season: str, episode: str, kitsu: bool
++        self, torrent_hashes: list, type: str, season: str, episode: str, kitsu: bool, **kwargs
+     ):
+         chunk_size = 500
+         chunks = [
+diff --git a/comet/debrid/debridlink.py b/comet/debrid/debridlink.py
+index b3f7261..1d65bd2 100644
+--- a/comet/debrid/debridlink.py
++++ b/comet/debrid/debridlink.py
+@@ -48,7 +48,7 @@ async def get_instant(self, chunk: list):
+         return responses
+ 
+     async def get_files(
+-        self, torrent_hashes: list, type: str, season: str, episode: str, kitsu: bool
++        self, torrent_hashes: list, type: str, season: str, episode: str, kitsu: bool, **kwargs
+     ):
+         chunk_size = 10
+         chunks = [
+diff --git a/comet/debrid/premiumize.py b/comet/debrid/premiumize.py
+index 6631e14..27fdc93 100644
+--- a/comet/debrid/premiumize.py
++++ b/comet/debrid/premiumize.py
+@@ -49,7 +49,7 @@ async def get_instant(self, chunk: list):
+             )
+ 
+     async def get_files(
+-        self, torrent_hashes: list, type: str, season: str, episode: str, kitsu: bool
++        self, torrent_hashes: list, type: str, season: str, episode: str, kitsu: bool, **kwargs
+     ):
+         chunk_size = 100
+         chunks = [
+diff --git a/comet/debrid/realdebrid.py b/comet/debrid/realdebrid.py
+index d37c864..33b993e 100644
+--- a/comet/debrid/realdebrid.py
++++ b/comet/debrid/realdebrid.py
+@@ -42,7 +42,7 @@ async def get_instant(self, chunk: list):
+             )
+ 
+     async def get_files(
+-        self, torrent_hashes: list, type: str, season: str, episode: str, kitsu: bool
++        self, torrent_hashes: list, type: str, season: str, episode: str, kitsu: bool, **kwargs
+     ):
+         chunk_size = 100
+         chunks = [
+diff --git a/comet/debrid/stremthru.py b/comet/debrid/stremthru.py
+index aebf4ff..ed41c6b 100644
+--- a/comet/debrid/stremthru.py
++++ b/comet/debrid/stremthru.py
+@@ -58,11 +58,12 @@ async def check_premium(self):
+ 
+         return False
+ 
+-    async def get_instant(self, magnets: list):
++    async def get_instant(self, magnets: list, sid: Optional[str] = None):
+         try:
+-            magnet = await self.session.get(
+-                f"{self.base_url}/magnets/check?magnet={','.join(magnets)}&client_ip={self.client_ip}"
+-            )
++            url = f"{self.base_url}/magnets/check?magnet={','.join(magnets)}&client_ip={self.client_ip}"
++            if sid:
++                url = f"{url}&sid={sid}"
++            magnet = await self.session.get(url)
+             return await magnet.json()
+         except Exception as e:
+             logger.warning(
+@@ -70,7 +71,14 @@ async def get_instant(self, magnets: list):
+             )
+ 
+     async def get_files(
+-        self, torrent_hashes: list, type: str, season: str, episode: str, kitsu: bool
++        self,
++        torrent_hashes: list,
++        type: str,
++        season: str,
++        episode: str,
++        kitsu: bool,
++        video_id: Optional[str] = None,
++        **kwargs,
+     ):
+         chunk_size = 25
+         chunks = [
+@@ -80,7 +88,7 @@ async def get_files(
+ 
+         tasks = []
+         for chunk in chunks:
+-            tasks.append(self.get_instant(chunk))
++            tasks.append(self.get_instant(chunk, sid=video_id))
+ 
+         responses = await asyncio.gather(*tasks)
+ 
+diff --git a/comet/debrid/torbox.py b/comet/debrid/torbox.py
+index 2e9cd6d..7e17054 100644
+--- a/comet/debrid/torbox.py
++++ b/comet/debrid/torbox.py
+@@ -41,7 +41,7 @@ async def get_instant(self, chunk: list):
+             )
+ 
+     async def get_files(
+-        self, torrent_hashes: list, type: str, season: str, episode: str, kitsu: bool
++        self, torrent_hashes: list, type: str, season: str, episode: str, kitsu: bool, **kwargs
+     ):
+         chunk_size = 50
+         chunks = [
