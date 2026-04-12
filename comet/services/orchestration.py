@@ -12,7 +12,8 @@ from comet.services.filtering import filter_worker
 from comet.services.ranking import rank_worker
 from comet.services.torrent_manager import torrent_update_queue
 from comet.utils.media_ids import normalize_cache_media_ids
-from comet.utils.parsing import ensure_multi_language, parsed_matches_target
+from comet.utils.parsing import ensure_multi_language, needs_multi_language, parsed_matches_target
+from comet.services.redis_cache import redis_mark_fresh_torrents
 from comet.utils.torrent_cache import (build_torrent_cache_where,
                                        normalize_search_params)
 
@@ -167,8 +168,9 @@ class TorrentManager:
             rows = list(best_rows.values())
 
         for row in rows:
-            parsed_data = ParsedData(**orjson.loads(row["parsed_json"]))
-            ensure_multi_language(parsed_data)
+            parsed_data = ParsedData.model_construct(**orjson.loads(row["parsed_json"]))
+            if needs_multi_language(parsed_data):
+                ensure_multi_language(parsed_data)
 
             target_season = self.search_season
             if (
@@ -239,6 +241,11 @@ class TorrentManager:
             )
 
     async def cache_torrents(self):
+        if self.ready_to_cache:
+            await redis_mark_fresh_torrents(
+                self.media_only_id, self.search_season, self.search_episode
+            )
+
         file_infos = []
         for torrent in self.ready_to_cache:
             self._append_cache_file_infos(file_infos, torrent)
@@ -270,7 +277,7 @@ class TorrentManager:
             return
 
         loop = asyncio.get_running_loop()
-        chunk_size = 20
+        chunk_size = 200
         tasks = [
             loop.run_in_executor(
                 get_executor(),

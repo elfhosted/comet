@@ -9,6 +9,7 @@ from comet.core.database import (build_upsert_assignments, database,
 from comet.core.logger import logger
 from comet.core.models import settings
 from comet.services.anime import anime_mapper
+from comet.services.redis_cache import redis_get_metadata, redis_set_metadata
 from comet.utils.parsing import parse_media_id
 
 from .imdb import get_imdb_metadata
@@ -163,6 +164,20 @@ class MetadataScraper:
         return aliases if isinstance(aliases, dict) else {}
 
     async def get_cached(self, media_id: str, season: int, episode: int):
+        # Try Redis first
+        cached = await redis_get_metadata(media_id)
+        if cached is not None:
+            return (
+                {
+                    "title": cached["title"],
+                    "year": cached.get("year"),
+                    "year_end": cached.get("year_end"),
+                    "season": season,
+                    "episode": episode,
+                },
+                cached["aliases"],
+            )
+
         row = await database.fetch_one(
             _CACHE_SELECT_QUERY,
             {
@@ -173,16 +188,19 @@ class MetadataScraper:
         if row is None:
             return None
 
-        return (
-            {
-                "title": row["title"],
-                "year": row["year"],
-                "year_end": row["year_end"],
-                "season": season,
-                "episode": episode,
-            },
-            self._load_cached_aliases(row["aliases_json"]),
-        )
+        metadata = {
+            "title": row["title"],
+            "year": row["year"],
+            "year_end": row["year_end"],
+            "season": season,
+            "episode": episode,
+        }
+        aliases = self._load_cached_aliases(row["aliases_json"])
+
+        # Backfill Redis
+        await redis_set_metadata(media_id, metadata, aliases)
+
+        return (metadata, aliases)
 
     async def cache_metadata(
         self,
@@ -208,7 +226,12 @@ class MetadataScraper:
             params["metadata_stale_before"] = current_time - settings.METADATA_CACHE_TTL
 
         row = await database.fetch_one(query, params, force_primary=True)
-        return self._load_cached_aliases(row["aliases_json"]) if row is not None else {}
+        aliases_result = self._load_cached_aliases(row["aliases_json"]) if row is not None else {}
+
+        # Write-through to Redis
+        await redis_set_metadata(media_id, metadata, aliases_result)
+
+        return aliases_result
 
     def normalize_metadata(self, metadata: dict, season: int, episode: int):
         if not metadata:

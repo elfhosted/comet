@@ -13,6 +13,8 @@ from comet.utils.signed_session import (derive_session_secret,
 
 router = APIRouter()
 templates = Jinja2Templates("comet/templates")
+templates.env.auto_reload = False
+templates.env.cache = None
 CONFIGURE_SESSION_COOKIE = "configure_session"
 CONFIGURE_PAGE_PASSWORD = settings.CONFIGURE_PAGE_PASSWORD
 CONFIGURE_PAGE_PASSWORD_ENABLED = bool(CONFIGURE_PAGE_PASSWORD)

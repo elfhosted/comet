@@ -6,6 +6,14 @@ SCRAPE_URL_MODE_BOTH = "both"
 SCRAPE_URL_MODES = frozenset((SCRAPE_URL_MODE_BOTH, "live", "background"))
 
 
+def needs_multi_language(parsed: ParsedData) -> bool:
+    """Check if ensure_multi_language would actually mutate this parsed object."""
+    languages = parsed.languages
+    return (len(languages) > 1 or parsed.dubbed) and not (
+        languages and languages[0] == "multi"
+    )
+
+
 def ensure_multi_language(parsed: ParsedData):
     languages = parsed.languages
 
@@ -15,13 +23,9 @@ def ensure_multi_language(parsed: ParsedData):
     if languages and languages[0] == "multi":
         return
 
-    try:
-        languages.remove("multi")
-    except ValueError:
-        pass
-
-    languages.insert(0, "multi")
-    parsed.languages = languages
+    new_languages = [lang for lang in languages if lang != "multi"]
+    new_languages.insert(0, "multi")
+    parsed.languages = new_languages
 
 
 def is_video(title: str):

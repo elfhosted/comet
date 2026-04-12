@@ -65,7 +65,7 @@ class AppSettings(BaseSettings):
     FASTAPI_WORKERS: Optional[int] = 1
     USE_GUNICORN: Optional[bool] = True
     GUNICORN_PRELOAD_APP: Optional[bool] = True
-    EXECUTOR_MAX_WORKERS: Optional[int] = 1
+    EXECUTOR_MAX_WORKERS: Optional[int] = None
     ADMIN_DASHBOARD_PASSWORD: Optional[str] = "".join(
         random.choices(string.ascii_letters + string.digits, k=16)
     )
@@ -216,7 +216,11 @@ class AppSettings(BaseSettings):
     RATELIMIT_MAX_RETRIES: Optional[int] = 3
     RATELIMIT_RETRY_BASE_DELAY: Optional[float] = 1.0
     RTN_FILTER_DEBUG: Optional[bool] = False
-    FILTER_PARSE_CACHE_SIZE: Optional[int] = 10000
+    MAX_RESULTS_PER_RESOLUTION: Optional[int] = 0  # Server-side cap, 0 = unlimited
+    STREAM_REQUEST_TIMEOUT: Optional[int] = 0  # Overall timeout in seconds for stream requests, 0 = unlimited
+    DISABLE_BACKGROUND_SCRAPE: Optional[bool] = False  # Skip background scrapes (stale/first_search)
+    MAX_DEBRID_FILES_PER_CHECK: Optional[int] = 0  # Cap files parsed during debrid availability, 0 = unlimited
+    FILTER_PARSE_CACHE_SIZE: Optional[int] = 50000
     FILTER_PARSE_CACHE_SHARDS: Optional[int] = 8
     FILTER_PARSE_CACHE_DEDUP_INFLIGHT: Optional[bool] = True
     HTTP_CACHE_ENABLED: Optional[bool] = False
@@ -231,6 +235,8 @@ class AppSettings(BaseSettings):
     HTTP_CACHE_CONFIGURE_TTL: Optional[int] = 86400
     DOWNLOAD_GENERIC_TRACKERS: Optional[bool] = False
     SMART_LANGUAGE_DETECTION: Optional[bool] = False
+    REDIS_URL: Optional[str] = None
+    REDIS_CACHE_TTL: Optional[int] = 300
 
     # CometNet P2P Network Configuration
     COMETNET_ENABLED: Optional[bool] = False
@@ -340,7 +346,7 @@ class AppSettings(BaseSettings):
     @field_validator("EXECUTOR_MAX_WORKERS", mode="before")
     def normalize_executor_workers(cls, v):
         if v is None or v == "" or str(v).lower() == "none":
-            return 1
+            return None
         return v
 
     @field_validator(

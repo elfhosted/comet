@@ -63,12 +63,6 @@ def _parse_cache_shard_for(title: str):
     return shard_idx, _parse_cache[shard_idx], _PARSE_CACHE_SHARD_SIZES[shard_idx]
 
 
-def _clone_parsed(parsed):
-    if hasattr(parsed, "model_copy"):
-        return parsed.model_copy(deep=True)
-    return parsed.copy(deep=True)
-
-
 def _parse_with_cache(title: str):
     if _PARSE_CACHE_SIZE <= 0 or _PARSE_CACHE_EFFECTIVE_SHARDS <= 0:
         return parse(title)
@@ -88,13 +82,12 @@ def _parse_with_cache_simple(title: str, shard: _ParseCacheShard, max_size: int)
         cached = shard.data.get(title)
         if cached is not None:
             shard.data.move_to_end(title)
-            return _clone_parsed(cached)
+            return cached
 
     parsed = parse(title)
-    cached = _clone_parsed(parsed)
 
     with shard.lock:
-        shard.data[title] = cached
+        shard.data[title] = parsed
         if len(shard.data) > max_size:
             shard.data.popitem(last=False)
 
@@ -109,7 +102,7 @@ def _parse_with_cache_dedup(title: str, shard: _ParseCacheShard, max_size: int):
         cached = shard.data.get(title)
         if cached is not None:
             shard.data.move_to_end(title)
-            return _clone_parsed(cached)
+            return cached
 
         inflight_event = shard.inflight.get(title)
         if inflight_event is None:
@@ -125,7 +118,7 @@ def _parse_with_cache_dedup(title: str, shard: _ParseCacheShard, max_size: int):
             cached = shard.data.get(title)
             if cached is not None:
                 shard.data.move_to_end(title)
-                return _clone_parsed(cached)
+                return cached
 
         return parse(title)
 
@@ -140,9 +133,8 @@ def _do_parse_and_cache(
 ):
     try:
         parsed = parse(title)
-        cached = _clone_parsed(parsed)
         with shard.lock:
-            shard.data[title] = cached
+            shard.data[title] = parsed
             if len(shard.data) > max_size:
                 shard.data.popitem(last=False)
             shard.inflight.pop(title, None)
@@ -228,15 +220,26 @@ def filter_worker(
             _log_exclusion(f"❌ Rejected (Parse Error) | {torrent_title}")
             continue
 
+        # Only shallow-copy when language mutation is actually needed
+        copied = False
+
         if parsed.parsed_title and country_aliases:
             language = country_aliases.get(scrub(parsed.parsed_title))
             if language and language not in parsed.languages:
                 _log_exclusion(
                     f"🏷️ Added Language (Alias) | {torrent_title} | {language}"
                 )
-                parsed.languages.append(language)
+                parsed = parsed.model_copy()
+                copied = True
+                parsed.languages = list(parsed.languages) + [language]
 
-        ensure_multi_language(parsed)
+        languages = parsed.languages
+        if (len(languages) > 1 or parsed.dubbed) and not (
+            languages and languages[0] == "multi"
+        ):
+            if not copied:
+                parsed = parsed.model_copy()
+            ensure_multi_language(parsed)
 
         if remove_adult_content and parsed.adult:
             _log_exclusion(f"🔞 Rejected (Adult) | {torrent_title}")

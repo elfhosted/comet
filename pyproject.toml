@@ -30,6 +30,7 @@ dependencies = [
     "msgpack",
     "miniupnpc",
     "aiofiles",
+    "redis",
     "torrent-parse-rank",
 ]
 

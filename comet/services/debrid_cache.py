@@ -5,6 +5,8 @@ from comet.core.database import (build_distinct_from_predicate,
                                  build_scope_lookup_params, build_scope_params,
                                  build_upsert_assignments, encode_json_param)
 from comet.core.models import database, settings
+from comet.services.redis_cache import (redis_get_debrid_availability,
+                                        redis_set_debrid_availability)
 from comet.utils.parsing import default_dump
 
 DEBRID_UPDATE_INTERVAL = (
@@ -100,6 +102,20 @@ async def cache_availability(debrid_service: str, availability: list):
         for file in availability
     ]
 
+    # Write-through to Redis (group by season/episode)
+    by_se = {}
+    for val in values:
+        se_key = (val.get("season"), val.get("episode"))
+        by_se.setdefault(se_key, []).append({
+            "info_hash": val["info_hash"],
+            "file_index": val.get("file_index"),
+            "title": val.get("title"),
+            "size": val.get("size"),
+            "parsed": val.get("parsed_json"),
+        })
+    for (s, e), rows in by_se.items():
+        await redis_set_debrid_availability(debrid_service, rows, season=s, episode=e)
+
     await database.execute_many(CACHE_AVAILABILITY_QUERY, values)
 
 
@@ -109,6 +125,13 @@ async def get_cached_availability(
     season: int | None = None,
     episode: int | None = None,
 ):
+    # Try Redis first
+    redis_results = await redis_get_debrid_availability(
+        debrid_service, info_hashes, season, episode
+    )
+    if redis_results is not None:
+        return redis_results
+
     select_clause = "SELECT info_hash, file_index, title, size, parsed_json AS parsed"
 
     min_timestamp = time.time() - settings.DEBRID_CACHE_TTL
@@ -159,6 +182,20 @@ async def get_cached_availability(
             AND {SCOPE_FILTER_SQL}
         """
         results = await database.fetch_all(query, params)
+
+    # Backfill Redis with DB results
+    if results:
+        redis_rows = [
+            {
+                "info_hash": r["info_hash"],
+                "file_index": r["file_index"],
+                "title": r["title"],
+                "size": r["size"],
+                "parsed": r["parsed"],
+            }
+            for r in results
+        ]
+        await redis_set_debrid_availability(debrid_service, redis_rows, season, episode)
 
     return results
 

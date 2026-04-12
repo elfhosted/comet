@@ -30,6 +30,11 @@ from comet.utils.formatting import (format_chilllink, format_title,
 from comet.utils.http_client import http_client_manager
 from comet.utils.network import get_client_ip
 from comet.utils.parsing import parse_media_id
+from comet.services.redis_cache import (
+    get_cached_ranked, set_cached_ranked,
+    get_cached_torrents as redis_get_torrents,
+    set_cached_torrents as redis_set_torrents,
+)
 
 streams = APIRouter()
 STREMIO_API_PREFIX = settings.STREMIO_API_PREFIX
@@ -634,7 +639,16 @@ async def stream(
         reject_unknown_episode_files=reject_unknown_episode_files,
     )
 
-    await torrent_manager.get_cached_torrents()
+    redis_torrents = await redis_get_torrents(media_only_id, search_season, search_episode)
+    if redis_torrents is not None:
+        torrent_manager.torrents = redis_torrents
+        torrent_manager.primary_cached = True
+    else:
+        await torrent_manager.get_cached_torrents()
+        await redis_set_torrents(
+            media_only_id, search_season, search_episode,
+            torrent_manager.torrents, settings.REDIS_CACHE_TTL,
+        )
     torrent_count = len(torrent_manager.torrents)
     logger.log("SCRAPER", f"📦 Found cached torrents: {torrent_count}")
     primary_cached = torrent_manager.primary_cached
@@ -694,7 +708,7 @@ async def stream(
             }
         )
 
-    if cache_result.should_scrape_background and not force_scrape_now:
+    if cache_result.should_scrape_background and not force_scrape_now and not settings.DISABLE_BACKGROUND_SCRAPE:
         logger.log(
             "SCRAPER",
             f"🔄 Starting background scrape for {log_title} (state={cache_result.state.value})",
@@ -708,26 +722,38 @@ async def stream(
             session,
         )
 
+    stream_timeout = settings.STREAM_REQUEST_TIMEOUT
+    _deadline = (asyncio.get_event_loop().time() + stream_timeout) if stream_timeout else None
+
+    def _remaining_timeout():
+        if _deadline is None:
+            return None
+        remaining = _deadline - asyncio.get_event_loop().time()
+        return max(remaining, 0.1)
+
     if cache_result.should_scrape_now or force_scrape_now:
         logger.log("SCRAPER", f"🔎 Starting new search for {log_title}")
         try:
-            if use_account_scrape:
-                scrape_result, warmup_result = await asyncio.gather(
-                    torrent_manager.scrape_torrents(),
-                    ensure_account_snapshot_ready(session, debrid_entries, ip),
-                    return_exceptions=True,
+            async with asyncio.timeout(_remaining_timeout()):
+                if use_account_scrape:
+                    scrape_result, warmup_result = await asyncio.gather(
+                        torrent_manager.scrape_torrents(),
+                        ensure_account_snapshot_ready(session, debrid_entries, ip),
+                        return_exceptions=True,
+                    )
+                    if isinstance(scrape_result, Exception):
+                        raise scrape_result
+                    if isinstance(warmup_result, Exception):
+                        raise warmup_result
+                    account_snapshot_ready = True
+                else:
+                    await torrent_manager.scrape_torrents()
+                logger.log(
+                    "SCRAPER",
+                    f"📥 Torrents after global RTN filtering: {len(torrent_manager.torrents)}",
                 )
-                if isinstance(scrape_result, Exception):
-                    raise scrape_result
-                if isinstance(warmup_result, Exception):
-                    raise warmup_result
-                account_snapshot_ready = True
-            else:
-                await torrent_manager.scrape_torrents()
-            logger.log(
-                "SCRAPER",
-                f"📥 Torrents after global RTN filtering: {len(torrent_manager.torrents)}",
-            )
+        except TimeoutError:
+            logger.log("SCRAPER", f"⏰ Stream request timed out for {log_title}")
         finally:
             await cache_manager.release_lock()
 
@@ -882,13 +908,40 @@ async def stream(
 
     initial_torrent_count = len(torrent_manager.torrents)
 
-    await torrent_manager.rank_torrents(
-        config["rtnSettings"],
-        config["rtnRanking"],
-        0,
-        config["maxSize"],
-        config["removeTrash"],
+    rtn_settings = config["rtnSettings"]
+    rtn_ranking = config["rtnRanking"]
+    max_size = config["maxSize"]
+    remove_trash = config["removeTrash"]
+
+    # Effective per-resolution limit: user config wins, server cap as floor
+    user_max = config["maxResultsPerResolution"]
+    server_max = settings.MAX_RESULTS_PER_RESOLUTION
+    if user_max > 0 and server_max > 0:
+        effective_max_results = min(user_max, server_max)
+    elif user_max > 0:
+        effective_max_results = user_max
+    else:
+        effective_max_results = server_max  # 0 means unlimited
+
+    cached_ranked, cached_ranked_torrents = await get_cached_ranked(
+        media_only_id, search_season, search_episode,
+        rtn_settings, rtn_ranking, max_size, remove_trash,
+        effective_max_results,
     )
+    if cached_ranked is not None:
+        torrent_manager.ranked_torrents = {h: True for h in cached_ranked}
+        torrent_manager.torrents.update(cached_ranked_torrents)
+    else:
+        await torrent_manager.rank_torrents(
+            rtn_settings, rtn_ranking, effective_max_results, max_size, remove_trash,
+        )
+        await set_cached_ranked(
+            media_only_id, search_season, search_episode,
+            rtn_settings, rtn_ranking, max_size, remove_trash,
+            effective_max_results,
+            torrent_manager.ranked_torrents, torrent_manager.torrents,
+            settings.REDIS_CACHE_TTL,
+        )
     logger.log(
         "SCRAPER",
         f"⚖️  Torrents after user RTN filtering: {len(torrent_manager.ranked_torrents)}/{initial_torrent_count}",
@@ -973,7 +1026,7 @@ async def stream(
             torrent_title,
             torrent["seeders"],
             torrent_size,
-            torrent["tracker"],
+            "ElfCache",
             config["resultFormat"],
         )
         formatted_title = format_title_fn(formatted_components)

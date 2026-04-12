@@ -19,6 +19,7 @@ from comet.core.database import (cleanup_expired_kodi_setup_codes,
                                  cleanup_expired_locks, setup_database,
                                  teardown_database)
 from comet.core.execution import setup_executor, shutdown_executor
+from comet.services.redis_cache import setup_redis, shutdown_redis
 from comet.core.logger import logger
 from comet.core.models import STREMIO_API_PREFIX, settings
 from comet.services.anime import anime_mapper
@@ -58,6 +59,7 @@ async def lifespan(app: FastAPI):
 
     await setup_database()
     setup_executor()
+    await setup_redis()
     await http_client_manager.init()
 
     if settings.DOWNLOAD_GENERIC_TRACKERS:
@@ -175,6 +177,7 @@ async def lifespan(app: FastAPI):
         await network_manager.close_all()
         await http_client_manager.close()
 
+        await shutdown_redis()
         await teardown_database()
         shutdown_executor()
 

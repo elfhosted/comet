@@ -7,7 +7,7 @@ from comet.debrid.manager import retrieve_debrid_availability
 from comet.services.debrid_cache import (cache_availability,
                                          get_cached_availability,
                                          get_cached_availability_any_service)
-from comet.utils.parsing import ensure_multi_language
+from comet.utils.parsing import ensure_multi_language, needs_multi_language
 
 
 class DebridService:
@@ -41,9 +41,12 @@ class DebridService:
         original: ParsedData | None, incoming: ParsedData | None
     ) -> ParsedData | None:
         if incoming is None:
+            if original is not None and needs_multi_language(original):
+                ensure_multi_language(original)
             return original
         if original is None:
-            ensure_multi_language(incoming)
+            if needs_multi_language(incoming):
+                ensure_multi_language(incoming)
             return incoming
 
         merged = incoming
@@ -69,7 +72,8 @@ class DebridService:
         ):
             DebridService._backfill_attr(merged, original, attr)
 
-        ensure_multi_language(merged)
+        if needs_multi_language(merged):
+            ensure_multi_language(merged)
         return merged
 
     async def get_and_cache_availability(
@@ -166,7 +170,7 @@ class DebridService:
                     torrent["size"] = row["size"]
 
                 if row["parsed"] is not None:
-                    cached_parsed = ParsedData(**orjson.loads(row["parsed"]))
+                    cached_parsed = ParsedData.model_construct(**orjson.loads(row["parsed"]))
                     merged_parsed = self._merge_parsed(
                         torrent.get("parsed"), cached_parsed
                     )

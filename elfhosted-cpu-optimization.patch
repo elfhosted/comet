@@ -1,0 +1,2635 @@
+From 5760fc708461d370f848f10ba1438f9f2db71da2 Mon Sep 17 00:00:00 2001
+From: Elfbot <elfbot@elfhosted.com>
+Date: Tue, 24 Mar 2026 15:06:20 +1300
+Subject: [PATCH] perf: ElfHosted CPU optimization patches rebased onto v2.53.0
+
+Rebased all CPU optimization patches from v2.52.0 to v2.53.0, adapting
+for upstream column renames (parsed_json, sources_json, updated_at,
+aliases_json), table renames (media_metadata_cache), new schema migration
+system, and Rust-powered torrent-parse-rank dependency.
+
+Includes fix for unbounded Redis debrid cache growth (per-hash keys
+with individual TTL instead of single hash).
+
+Removed pre-cap ranking optimization (RANK_CANDIDATE_MULTIPLIER) as the
+Rust-backed RTN makes it unnecessary.
+
+Fix Jinja2 template cache crash on Python 3.13 (unhashable dict in
+LRU cache key).
+
+Brand all scraper results as ElfCache in stream output.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ comet/api/app.py                 |    3 +
+ comet/api/endpoints/config.py    |    2 +
+ comet/api/endpoints/stream.py    |  103 ++-
+ comet/core/execution.py          |   26 +-
+ comet/core/models.py             |   12 +-
+ comet/debrid/stremthru.py        |   16 +-
+ comet/metadata/manager.py        |   45 +-
+ comet/scrapers/comet.py          |    8 +-
+ comet/services/cache_state.py    |   18 +
+ comet/services/debrid.py         |   12 +-
+ comet/services/debrid_cache.py   |   37 +
+ comet/services/filtering.py      |   35 +-
+ comet/services/lock.py           |   57 ++
+ comet/services/orchestration.py  |   15 +-
+ comet/services/redis_cache.py    |  409 ++++++++++
+ comet/utils/parsing.py           |   18 +-
+ elfhosted-cpu-optimization.patch | 1308 ++++++++++++++++++++++++++++++
+ pyproject.toml                   |    1 +
+ 18 files changed, 2022 insertions(+), 103 deletions(-)
+ create mode 100644 comet/services/redis_cache.py
+ create mode 100644 elfhosted-cpu-optimization.patch
+
+diff --git a/comet/api/app.py b/comet/api/app.py
+index 4a1ec29..feefb6f 100644
+--- a/comet/api/app.py
++++ b/comet/api/app.py
+@@ -19,6 +19,7 @@ from comet.core.database import (cleanup_expired_kodi_setup_codes,
+                                  cleanup_expired_locks, setup_database,
+                                  teardown_database)
+ from comet.core.execution import setup_executor, shutdown_executor
++from comet.services.redis_cache import setup_redis, shutdown_redis
+ from comet.core.logger import logger
+ from comet.core.models import STREMIO_API_PREFIX, settings
+ from comet.services.anime import anime_mapper
+@@ -58,6 +59,7 @@ async def lifespan(app: FastAPI):
+ 
+     await setup_database()
+     setup_executor()
++    await setup_redis()
+     await http_client_manager.init()
+ 
+     if settings.DOWNLOAD_GENERIC_TRACKERS:
+@@ -175,6 +177,7 @@ async def lifespan(app: FastAPI):
+         await network_manager.close_all()
+         await http_client_manager.close()
+ 
++        await shutdown_redis()
+         await teardown_database()
+         shutdown_executor()
+ 
+diff --git a/comet/api/endpoints/config.py b/comet/api/endpoints/config.py
+index 3acfae4..2cd5c09 100644
+--- a/comet/api/endpoints/config.py
++++ b/comet/api/endpoints/config.py
+@@ -13,6 +13,8 @@ from comet.utils.signed_session import (derive_session_secret,
+ 
+ router = APIRouter()
+ templates = Jinja2Templates("comet/templates")
++templates.env.auto_reload = False
++templates.env.cache = None
+ CONFIGURE_SESSION_COOKIE = "configure_session"
+ CONFIGURE_PAGE_PASSWORD = settings.CONFIGURE_PAGE_PASSWORD
+ CONFIGURE_PAGE_PASSWORD_ENABLED = bool(CONFIGURE_PAGE_PASSWORD)
+diff --git a/comet/api/endpoints/stream.py b/comet/api/endpoints/stream.py
+index 9fe2325..98ecb38 100644
+--- a/comet/api/endpoints/stream.py
++++ b/comet/api/endpoints/stream.py
+@@ -30,6 +30,11 @@ from comet.utils.formatting import (format_chilllink, format_title,
+ from comet.utils.http_client import http_client_manager
+ from comet.utils.network import get_client_ip
+ from comet.utils.parsing import parse_media_id
++from comet.services.redis_cache import (
++    get_cached_ranked, set_cached_ranked,
++    get_cached_torrents as redis_get_torrents,
++    set_cached_torrents as redis_set_torrents,
++)
+ 
+ streams = APIRouter()
+ STREMIO_API_PREFIX = settings.STREMIO_API_PREFIX
+@@ -601,7 +606,16 @@ async def stream(
+         reject_unknown_episode_files=strict_episode_matching,
+     )
+ 
+-    await torrent_manager.get_cached_torrents()
++    redis_torrents = await redis_get_torrents(media_only_id, search_season, search_episode)
++    if redis_torrents is not None:
++        torrent_manager.torrents = redis_torrents
++        torrent_manager.primary_cached = True
++    else:
++        await torrent_manager.get_cached_torrents()
++        await redis_set_torrents(
++            media_only_id, search_season, search_episode,
++            torrent_manager.torrents, settings.REDIS_CACHE_TTL,
++        )
+     torrent_count = len(torrent_manager.torrents)
+     logger.log("SCRAPER", f"📦 Found cached torrents: {torrent_count}")
+     primary_cached = torrent_manager.primary_cached
+@@ -661,7 +675,7 @@ async def stream(
+             }
+         )
+ 
+-    if cache_result.should_scrape_background and not force_scrape_now:
++    if cache_result.should_scrape_background and not force_scrape_now and not settings.DISABLE_BACKGROUND_SCRAPE:
+         logger.log(
+             "SCRAPER",
+             f"🔄 Starting background scrape for {log_title} (state={cache_result.state.value})",
+@@ -675,26 +689,38 @@ async def stream(
+             session,
+         )
+ 
++    stream_timeout = settings.STREAM_REQUEST_TIMEOUT
++    _deadline = (asyncio.get_event_loop().time() + stream_timeout) if stream_timeout else None
++
++    def _remaining_timeout():
++        if _deadline is None:
++            return None
++        remaining = _deadline - asyncio.get_event_loop().time()
++        return max(remaining, 0.1)
++
+     if cache_result.should_scrape_now or force_scrape_now:
+         logger.log("SCRAPER", f"🔎 Starting new search for {log_title}")
+         try:
+-            if use_account_scrape:
+-                scrape_result, warmup_result = await asyncio.gather(
+-                    torrent_manager.scrape_torrents(),
+-                    ensure_account_snapshot_ready(session, debrid_entries, ip),
+-                    return_exceptions=True,
++            async with asyncio.timeout(_remaining_timeout()):
++                if use_account_scrape:
++                    scrape_result, warmup_result = await asyncio.gather(
++                        torrent_manager.scrape_torrents(),
++                        ensure_account_snapshot_ready(session, debrid_entries, ip),
++                        return_exceptions=True,
++                    )
++                    if isinstance(scrape_result, Exception):
++                        raise scrape_result
++                    if isinstance(warmup_result, Exception):
++                        raise warmup_result
++                    account_snapshot_ready = True
++                else:
++                    await torrent_manager.scrape_torrents()
++                logger.log(
++                    "SCRAPER",
++                    f"📥 Torrents after global RTN filtering: {len(torrent_manager.torrents)}",
+                 )
+-                if isinstance(scrape_result, Exception):
+-                    raise scrape_result
+-                if isinstance(warmup_result, Exception):
+-                    raise warmup_result
+-                account_snapshot_ready = True
+-            else:
+-                await torrent_manager.scrape_torrents()
+-            logger.log(
+-                "SCRAPER",
+-                f"📥 Torrents after global RTN filtering: {len(torrent_manager.torrents)}",
+-            )
++        except TimeoutError:
++            logger.log("SCRAPER", f"⏰ Stream request timed out for {log_title}")
+         finally:
+             await cache_manager.release_lock()
+ 
+@@ -849,13 +875,40 @@ async def stream(
+ 
+     initial_torrent_count = len(torrent_manager.torrents)
+ 
+-    await torrent_manager.rank_torrents(
+-        config["rtnSettings"],
+-        config["rtnRanking"],
+-        0,
+-        config["maxSize"],
+-        config["removeTrash"],
++    rtn_settings = config["rtnSettings"]
++    rtn_ranking = config["rtnRanking"]
++    max_size = config["maxSize"]
++    remove_trash = config["removeTrash"]
++
++    # Effective per-resolution limit: user config wins, server cap as floor
++    user_max = config["maxResultsPerResolution"]
++    server_max = settings.MAX_RESULTS_PER_RESOLUTION
++    if user_max > 0 and server_max > 0:
++        effective_max_results = min(user_max, server_max)
++    elif user_max > 0:
++        effective_max_results = user_max
++    else:
++        effective_max_results = server_max  # 0 means unlimited
++
++    cached_ranked, cached_ranked_torrents = await get_cached_ranked(
++        media_only_id, search_season, search_episode,
++        rtn_settings, rtn_ranking, max_size, remove_trash,
++        effective_max_results,
+     )
++    if cached_ranked is not None:
++        torrent_manager.ranked_torrents = {h: True for h in cached_ranked}
++        torrent_manager.torrents.update(cached_ranked_torrents)
++    else:
++        await torrent_manager.rank_torrents(
++            rtn_settings, rtn_ranking, effective_max_results, max_size, remove_trash,
++        )
++        await set_cached_ranked(
++            media_only_id, search_season, search_episode,
++            rtn_settings, rtn_ranking, max_size, remove_trash,
++            effective_max_results,
++            torrent_manager.ranked_torrents, torrent_manager.torrents,
++            settings.REDIS_CACHE_TTL,
++        )
+     logger.log(
+         "SCRAPER",
+         f"⚖️  Torrents after user RTN filtering: {len(torrent_manager.ranked_torrents)}/{initial_torrent_count}",
+@@ -940,7 +993,7 @@ async def stream(
+             torrent_title,
+             torrent["seeders"],
+             torrent_size,
+-            torrent["tracker"],
++            "ElfCache",
+             config["resultFormat"],
+         )
+         formatted_title = format_title_fn(formatted_components)
+diff --git a/comet/core/execution.py b/comet/core/execution.py
+index 1946f63..18a8bba 100644
+--- a/comet/core/execution.py
++++ b/comet/core/execution.py
+@@ -1,33 +1,19 @@
+ import atexit
+-import multiprocessing
+-import signal
+-from concurrent.futures import ProcessPoolExecutor
++import os
++from concurrent.futures import ThreadPoolExecutor
+ 
+ from comet.core.models import settings
+ 
+-_mp_context = None
+-try:
+-    _mp_context = multiprocessing.get_context("forkserver")
+-except ValueError:
+-    _mp_context = multiprocessing.get_context("spawn")
+-
+ app_executor = None
+ max_workers = settings.EXECUTOR_MAX_WORKERS
+-# if max_workers is None:
+-#     cpu_count = os.cpu_count() or 1
+-#     max_workers = min(cpu_count, 4)
+-
+-
+-def worker_initializer():
+-    signal.signal(signal.SIGINT, signal.SIG_IGN)
++if max_workers is None or max_workers < 1:
++    cpu_count = os.cpu_count() or 1
++    max_workers = min(cpu_count, 4)
+ 
+ 
+ def setup_executor():
+     global app_executor
+-
+-    app_executor = ProcessPoolExecutor(
+-        max_workers=max_workers, mp_context=_mp_context, initializer=worker_initializer
+-    )
++    app_executor = ThreadPoolExecutor(max_workers=max_workers)
+ 
+ 
+ def shutdown_executor():
+diff --git a/comet/core/models.py b/comet/core/models.py
+index de331ae..c6a6947 100644
+--- a/comet/core/models.py
++++ b/comet/core/models.py
+@@ -65,7 +65,7 @@ class AppSettings(BaseSettings):
+     FASTAPI_WORKERS: Optional[int] = 1
+     USE_GUNICORN: Optional[bool] = True
+     GUNICORN_PRELOAD_APP: Optional[bool] = True
+-    EXECUTOR_MAX_WORKERS: Optional[int] = 1
++    EXECUTOR_MAX_WORKERS: Optional[int] = None
+     ADMIN_DASHBOARD_PASSWORD: Optional[str] = "".join(
+         random.choices(string.ascii_letters + string.digits, k=16)
+     )
+@@ -216,7 +216,11 @@ class AppSettings(BaseSettings):
+     RATELIMIT_MAX_RETRIES: Optional[int] = 3
+     RATELIMIT_RETRY_BASE_DELAY: Optional[float] = 1.0
+     RTN_FILTER_DEBUG: Optional[bool] = False
+-    FILTER_PARSE_CACHE_SIZE: Optional[int] = 10000
++    MAX_RESULTS_PER_RESOLUTION: Optional[int] = 0  # Server-side cap, 0 = unlimited
++    STREAM_REQUEST_TIMEOUT: Optional[int] = 0  # Overall timeout in seconds for stream requests, 0 = unlimited
++    DISABLE_BACKGROUND_SCRAPE: Optional[bool] = False  # Skip background scrapes (stale/first_search)
++    MAX_DEBRID_FILES_PER_CHECK: Optional[int] = 0  # Cap files parsed during debrid availability, 0 = unlimited
++    FILTER_PARSE_CACHE_SIZE: Optional[int] = 50000
+     FILTER_PARSE_CACHE_SHARDS: Optional[int] = 8
+     FILTER_PARSE_CACHE_DEDUP_INFLIGHT: Optional[bool] = True
+     HTTP_CACHE_ENABLED: Optional[bool] = False
+@@ -231,6 +235,8 @@ class AppSettings(BaseSettings):
+     HTTP_CACHE_CONFIGURE_TTL: Optional[int] = 86400
+     DOWNLOAD_GENERIC_TRACKERS: Optional[bool] = False
+     SMART_LANGUAGE_DETECTION: Optional[bool] = False
++    REDIS_URL: Optional[str] = None
++    REDIS_CACHE_TTL: Optional[int] = 300
+ 
+     # CometNet P2P Network Configuration
+     COMETNET_ENABLED: Optional[bool] = False
+@@ -339,7 +345,7 @@ class AppSettings(BaseSettings):
+     @field_validator("EXECUTOR_MAX_WORKERS", mode="before")
+     def normalize_executor_workers(cls, v):
+         if v is None or v == "" or str(v).lower() == "none":
+-            return 1
++            return None
+         return v
+ 
+     @field_validator(
+diff --git a/comet/debrid/stremthru.py b/comet/debrid/stremthru.py
+index be9b2d8..e518645 100644
+--- a/comet/debrid/stremthru.py
++++ b/comet/debrid/stremthru.py
+@@ -2,7 +2,7 @@ import asyncio
+ from urllib.parse import quote, unquote
+ 
+ import aiohttp
+-from RTN import normalize_title, parse, title_match
++from RTN import normalize_title, title_match
+ 
+ from comet.core.execution import get_executor
+ from comet.core.logger import logger
+@@ -10,16 +10,20 @@ from comet.core.models import settings
+ from comet.debrid.exceptions import DebridAuthError, DebridLinkGenerationError
+ from comet.metadata.episode_index import EpisodeIndexService
+ from comet.services.debrid_cache import cache_availability
+-from comet.services.filtering import quick_alias_match
++from comet.services.filtering import _parse_with_cache, quick_alias_match
+ from comet.services.torrent_manager import torrent_update_queue
+-from comet.utils.parsing import (ensure_multi_language, is_video,
++from comet.utils.parsing import (ensure_multi_language, needs_multi_language, is_video,
+                                  match_parsed_episode_target, parse_media_id)
+ 
+ 
+ def batch_parse(filenames):
+-    parsed_results = [parse(f) for f in filenames]
+-    for parsed in parsed_results:
+-        ensure_multi_language(parsed)
++    parsed_results = []
++    for f in filenames:
++        parsed = _parse_with_cache(f)
++        if needs_multi_language(parsed):
++            parsed = parsed.model_copy()
++            ensure_multi_language(parsed)
++        parsed_results.append(parsed)
+     return parsed_results
+ 
+ 
+diff --git a/comet/metadata/manager.py b/comet/metadata/manager.py
+index 2f499d8..2c5c9d0 100644
+--- a/comet/metadata/manager.py
++++ b/comet/metadata/manager.py
+@@ -9,6 +9,7 @@ from comet.core.database import (build_upsert_assignments, database,
+ from comet.core.logger import logger
+ from comet.core.models import settings
+ from comet.services.anime import anime_mapper
++from comet.services.redis_cache import redis_get_metadata, redis_set_metadata
+ from comet.utils.parsing import parse_media_id
+ 
+ from .imdb import get_imdb_metadata
+@@ -163,6 +164,20 @@ class MetadataScraper:
+         return aliases if isinstance(aliases, dict) else {}
+ 
+     async def get_cached(self, media_id: str, season: int, episode: int):
++        # Try Redis first
++        cached = await redis_get_metadata(media_id)
++        if cached is not None:
++            return (
++                {
++                    "title": cached["title"],
++                    "year": cached.get("year"),
++                    "year_end": cached.get("year_end"),
++                    "season": season,
++                    "episode": episode,
++                },
++                cached["aliases"],
++            )
++
+         row = await database.fetch_one(
+             _CACHE_SELECT_QUERY,
+             {
+@@ -173,16 +188,19 @@ class MetadataScraper:
+         if row is None:
+             return None
+ 
+-        return (
+-            {
+-                "title": row["title"],
+-                "year": row["year"],
+-                "year_end": row["year_end"],
+-                "season": season,
+-                "episode": episode,
+-            },
+-            self._load_cached_aliases(row["aliases_json"]),
+-        )
++        metadata = {
++            "title": row["title"],
++            "year": row["year"],
++            "year_end": row["year_end"],
++            "season": season,
++            "episode": episode,
++        }
++        aliases = self._load_cached_aliases(row["aliases_json"])
++
++        # Backfill Redis
++        await redis_set_metadata(media_id, metadata, aliases)
++
++        return (metadata, aliases)
+ 
+     async def cache_metadata(
+         self,
+@@ -208,7 +226,12 @@ class MetadataScraper:
+             params["metadata_stale_before"] = current_time - settings.METADATA_CACHE_TTL
+ 
+         row = await database.fetch_one(query, params, force_primary=True)
+-        return self._load_cached_aliases(row["aliases_json"]) if row is not None else {}
++        aliases_result = self._load_cached_aliases(row["aliases_json"]) if row is not None else {}
++
++        # Write-through to Redis
++        await redis_set_metadata(media_id, metadata, aliases_result)
++
++        return aliases_result
+ 
+     def normalize_metadata(self, metadata: dict, season: int, episode: int):
+         if not metadata:
+diff --git a/comet/scrapers/comet.py b/comet/scrapers/comet.py
+index 2fe1a5b..9e0a93c 100644
+--- a/comet/scrapers/comet.py
++++ b/comet/scrapers/comet.py
+@@ -29,10 +29,6 @@ class CometScraper(BaseScraper):
+                     else None
+                 )
+ 
+-                tracker = None
+-                if "🔎 " in title_full:
+-                    tracker = title_full.split("🔎 ")[1].split("\n")[0]
+-
+                 torrents.append(
+                     {
+                         "title": title,
+@@ -40,9 +36,7 @@ class CometScraper(BaseScraper):
+                         "fileIndex": torrent.get("fileIdx", None),
+                         "seeders": seeders,
+                         "size": torrent["behaviorHints"].get("videoSize"),
+-                        "tracker": f"Comet|{tracker}"
+-                        if tracker is not None
+-                        else "Comet",
++                        "tracker": "CometNet|ElfHosted",
+                         "sources": torrent.get("sources", []),
+                     }
+                 )
+diff --git a/comet/services/cache_state.py b/comet/services/cache_state.py
+index f99013a..c1b2722 100644
+--- a/comet/services/cache_state.py
++++ b/comet/services/cache_state.py
+@@ -8,6 +8,8 @@ from comet.core.database import (build_json_list_membership_predicate,
+ from comet.core.logger import logger
+ from comet.core.models import settings
+ from comet.services.lock import DistributedLock
++from comet.services.redis_cache import (redis_first_search,
++                                        redis_has_fresh_torrents)
+ from comet.utils.media_ids import normalize_cache_media_ids
+ from comet.utils.torrent_cache import normalize_search_params
+ 
+@@ -111,6 +113,16 @@ class CacheStateManager:
+         Returns 1 if any fresh torrent exists, otherwise 0.
+         If TTL is -1 (never expires), checks for any cached torrent.
+         """
++        # Try Redis first for each cache_media_id
++        for cache_media_id in self.cache_media_ids:
++            result = await redis_has_fresh_torrents(
++                cache_media_id, self.search_season, self.search_episode
++            )
++            if result is True:
++                return 1
++            # result is None means Redis unavailable, fall through to DB
++
++        # Fall back to DB
+         min_timestamp = None
+         if settings.LIVE_TORRENT_CACHE_TTL >= 0:
+             min_timestamp = time.time() - settings.LIVE_TORRENT_CACHE_TTL
+@@ -163,6 +175,12 @@ class CacheStateManager:
+         """
+         Check if this is the first search for this media_id.
+         """
++        # Try Redis first (single atomic SETNX)
++        redis_result = await redis_first_search(self.media_id)
++        if redis_result is not None:
++            return redis_result
++
++        # Fall back to DB
+         current_time = time.time()
+         insert_params = {
+             "media_id": self.media_id,
+diff --git a/comet/services/debrid.py b/comet/services/debrid.py
+index e3c562a..97eb57d 100644
+--- a/comet/services/debrid.py
++++ b/comet/services/debrid.py
+@@ -7,7 +7,7 @@ from comet.debrid.manager import retrieve_debrid_availability
+ from comet.services.debrid_cache import (cache_availability,
+                                          get_cached_availability,
+                                          get_cached_availability_any_service)
+-from comet.utils.parsing import ensure_multi_language
++from comet.utils.parsing import ensure_multi_language, needs_multi_language
+ 
+ 
+ class DebridService:
+@@ -41,9 +41,12 @@ class DebridService:
+         original: ParsedData | None, incoming: ParsedData | None
+     ) -> ParsedData | None:
+         if incoming is None:
++            if original is not None and needs_multi_language(original):
++                ensure_multi_language(original)
+             return original
+         if original is None:
+-            ensure_multi_language(incoming)
++            if needs_multi_language(incoming):
++                ensure_multi_language(incoming)
+             return incoming
+ 
+         merged = incoming
+@@ -69,7 +72,8 @@ class DebridService:
+         ):
+             DebridService._backfill_attr(merged, original, attr)
+ 
+-        ensure_multi_language(merged)
++        if needs_multi_language(merged):
++            ensure_multi_language(merged)
+         return merged
+ 
+     async def get_and_cache_availability(
+@@ -166,7 +170,7 @@ class DebridService:
+                     torrent["size"] = row["size"]
+ 
+                 if row["parsed"] is not None:
+-                    cached_parsed = ParsedData(**orjson.loads(row["parsed"]))
++                    cached_parsed = ParsedData.model_construct(**orjson.loads(row["parsed"]))
+                     merged_parsed = self._merge_parsed(
+                         torrent.get("parsed"), cached_parsed
+                     )
+diff --git a/comet/services/debrid_cache.py b/comet/services/debrid_cache.py
+index cfc1f5a..509611f 100644
+--- a/comet/services/debrid_cache.py
++++ b/comet/services/debrid_cache.py
+@@ -5,6 +5,8 @@ from comet.core.database import (build_distinct_from_predicate,
+                                  build_scope_lookup_params, build_scope_params,
+                                  build_upsert_assignments, encode_json_param)
+ from comet.core.models import database, settings
++from comet.services.redis_cache import (redis_get_debrid_availability,
++                                        redis_set_debrid_availability)
+ from comet.utils.parsing import default_dump
+ 
+ DEBRID_UPDATE_INTERVAL = (
+@@ -100,6 +102,20 @@ async def cache_availability(debrid_service: str, availability: list):
+         for file in availability
+     ]
+ 
++    # Write-through to Redis (group by season/episode)
++    by_se = {}
++    for val in values:
++        se_key = (val.get("season"), val.get("episode"))
++        by_se.setdefault(se_key, []).append({
++            "info_hash": val["info_hash"],
++            "file_index": val.get("file_index"),
++            "title": val.get("title"),
++            "size": val.get("size"),
++            "parsed": val.get("parsed_json"),
++        })
++    for (s, e), rows in by_se.items():
++        await redis_set_debrid_availability(debrid_service, rows, season=s, episode=e)
++
+     await database.execute_many(CACHE_AVAILABILITY_QUERY, values)
+ 
+ 
+@@ -109,6 +125,13 @@ async def get_cached_availability(
+     season: int | None = None,
+     episode: int | None = None,
+ ):
++    # Try Redis first
++    redis_results = await redis_get_debrid_availability(
++        debrid_service, info_hashes, season, episode
++    )
++    if redis_results is not None:
++        return redis_results
++
+     select_clause = "SELECT info_hash, file_index, title, size, parsed_json AS parsed"
+ 
+     min_timestamp = time.time() - settings.DEBRID_CACHE_TTL
+@@ -160,6 +183,20 @@ async def get_cached_availability(
+         """
+         results = await database.fetch_all(query, params)
+ 
++    # Backfill Redis with DB results
++    if results:
++        redis_rows = [
++            {
++                "info_hash": r["info_hash"],
++                "file_index": r["file_index"],
++                "title": r["title"],
++                "size": r["size"],
++                "parsed": r["parsed"],
++            }
++            for r in results
++        ]
++        await redis_set_debrid_availability(debrid_service, redis_rows, season, episode)
++
+     return results
+ 
+ 
+diff --git a/comet/services/filtering.py b/comet/services/filtering.py
+index c7cc424..c335aee 100644
+--- a/comet/services/filtering.py
++++ b/comet/services/filtering.py
+@@ -63,12 +63,6 @@ def _parse_cache_shard_for(title: str):
+     return shard_idx, _parse_cache[shard_idx], _PARSE_CACHE_SHARD_SIZES[shard_idx]
+ 
+ 
+-def _clone_parsed(parsed):
+-    if hasattr(parsed, "model_copy"):
+-        return parsed.model_copy(deep=True)
+-    return parsed.copy(deep=True)
+-
+-
+ def _parse_with_cache(title: str):
+     if _PARSE_CACHE_SIZE <= 0 or _PARSE_CACHE_EFFECTIVE_SHARDS <= 0:
+         return parse(title)
+@@ -88,13 +82,12 @@ def _parse_with_cache_simple(title: str, shard: _ParseCacheShard, max_size: int)
+         cached = shard.data.get(title)
+         if cached is not None:
+             shard.data.move_to_end(title)
+-            return _clone_parsed(cached)
++            return cached
+ 
+     parsed = parse(title)
+-    cached = _clone_parsed(parsed)
+ 
+     with shard.lock:
+-        shard.data[title] = cached
++        shard.data[title] = parsed
+         if len(shard.data) > max_size:
+             shard.data.popitem(last=False)
+ 
+@@ -109,7 +102,7 @@ def _parse_with_cache_dedup(title: str, shard: _ParseCacheShard, max_size: int):
+         cached = shard.data.get(title)
+         if cached is not None:
+             shard.data.move_to_end(title)
+-            return _clone_parsed(cached)
++            return cached
+ 
+         inflight_event = shard.inflight.get(title)
+         if inflight_event is None:
+@@ -125,7 +118,7 @@ def _parse_with_cache_dedup(title: str, shard: _ParseCacheShard, max_size: int):
+             cached = shard.data.get(title)
+             if cached is not None:
+                 shard.data.move_to_end(title)
+-                return _clone_parsed(cached)
++                return cached
+ 
+         return parse(title)
+ 
+@@ -140,9 +133,8 @@ def _do_parse_and_cache(
+ ):
+     try:
+         parsed = parse(title)
+-        cached = _clone_parsed(parsed)
+         with shard.lock:
+-            shard.data[title] = cached
++            shard.data[title] = parsed
+             if len(shard.data) > max_size:
+                 shard.data.popitem(last=False)
+             shard.inflight.pop(title, None)
+@@ -228,15 +220,26 @@ def filter_worker(
+             _log_exclusion(f"❌ Rejected (Parse Error) | {torrent_title}")
+             continue
+ 
++        # Only shallow-copy when language mutation is actually needed
++        copied = False
++
+         if parsed.parsed_title and country_aliases:
+             language = country_aliases.get(scrub(parsed.parsed_title))
+             if language and language not in parsed.languages:
+                 _log_exclusion(
+                     f"🏷️ Added Language (Alias) | {torrent_title} | {language}"
+                 )
+-                parsed.languages.append(language)
+-
+-        ensure_multi_language(parsed)
++                parsed = parsed.model_copy()
++                copied = True
++                parsed.languages = list(parsed.languages) + [language]
++
++        languages = parsed.languages
++        if (len(languages) > 1 or parsed.dubbed) and not (
++            languages and languages[0] == "multi"
++        ):
++            if not copied:
++                parsed = parsed.model_copy()
++            ensure_multi_language(parsed)
+ 
+         if remove_adult_content and parsed.adult:
+             _log_exclusion(f"🔞 Rejected (Adult) | {torrent_title}")
+diff --git a/comet/services/lock.py b/comet/services/lock.py
+index 0f842f9..27b9ee5 100644
+--- a/comet/services/lock.py
++++ b/comet/services/lock.py
+@@ -5,6 +5,11 @@ import uuid
+ from comet.core.database import database, fetch_flag
+ from comet.core.logger import logger
+ from comet.core.models import settings
++from comet.services.redis_cache import (is_redis_available,
++                                        redis_lock_acquire,
++                                        redis_lock_exists,
++                                        redis_lock_refresh,
++                                        redis_lock_release)
+ 
+ _ACQUIRE_OR_REFRESH_LOCK_QUERY = """
+     INSERT INTO scrape_locks (lock_key, instance_id, updated_at, expires_at)
+@@ -34,8 +39,38 @@ class DistributedLock:
+         self.retry_interval = retry_interval
+         self.instance_id = str(uuid.uuid4())
+         self.acquired = False
++        self._use_redis = is_redis_available()
+ 
+     async def acquire(self, wait_timeout: int = None):
++        if self._use_redis:
++            return await self._acquire_redis(wait_timeout)
++        return await self._acquire_db(wait_timeout)
++
++    async def _acquire_redis(self, wait_timeout: int = None):
++        start_time = time.time()
++        while True:
++            if self.acquired:
++                refreshed = await redis_lock_refresh(self.lock_key, self.instance_id, self.timeout)
++                if refreshed:
++                    return True
++                self.acquired = False
++
++            instance_id = await redis_lock_acquire(self.lock_key, self.timeout)
++            if instance_id:
++                self.instance_id = instance_id
++                self.acquired = True
++                return True
++
++            if wait_timeout is None:
++                return False
++
++            if wait_timeout > 0 and (time.time() - start_time) >= wait_timeout:
++                logger.log("LOCK", f"⏰ Lock acquisition timeout for {self.lock_key}")
++                return False
++
++            await asyncio.sleep(self.retry_interval)
++
++    async def _acquire_db(self, wait_timeout: int = None):
+         start_time = time.time()
+ 
+         while True:
+@@ -81,6 +116,11 @@ class DistributedLock:
+         if not self.acquired:
+             return
+ 
++        if self._use_redis:
++            await redis_lock_release(self.lock_key, self.instance_id)
++            self.acquired = False
++            return
++
+         try:
+             await database.execute(
+                 "DELETE FROM scrape_locks WHERE lock_key = :lock_key AND instance_id = :instance_id",
+@@ -98,3 +138,20 @@ class DistributedLock:
+ 
+     async def __aexit__(self, exc_type, exc_val, exc_tb):
+         await self.release()
++
++
++async def is_scrape_in_progress(media_id: str):
++    if is_redis_available():
++        return await redis_lock_exists(media_id)
++
++    try:
++        current_time = time.time()
++        row = await database.fetch_one(
++            "SELECT instance_id FROM scrape_locks WHERE lock_key = :lock_key AND expires_at >= :current_time",
++            {"lock_key": media_id, "current_time": current_time},
++            force_primary=True,
++        )
++        return row is not None
++    except Exception as e:
++        logger.log("LOCK", f"❌ Error checking scrape status for {media_id}: {e}")
++        return False
+diff --git a/comet/services/orchestration.py b/comet/services/orchestration.py
+index cab90ad..c3d4af6 100644
+--- a/comet/services/orchestration.py
++++ b/comet/services/orchestration.py
+@@ -12,7 +12,8 @@ from comet.services.filtering import filter_worker
+ from comet.services.ranking import rank_worker
+ from comet.services.torrent_manager import torrent_update_queue
+ from comet.utils.media_ids import normalize_cache_media_ids
+-from comet.utils.parsing import ensure_multi_language, parsed_matches_target
++from comet.utils.parsing import ensure_multi_language, needs_multi_language, parsed_matches_target
++from comet.services.redis_cache import redis_mark_fresh_torrents
+ from comet.utils.torrent_cache import (build_torrent_cache_where,
+                                        normalize_search_params)
+ 
+@@ -167,8 +168,9 @@ class TorrentManager:
+             rows = list(best_rows.values())
+ 
+         for row in rows:
+-            parsed_data = ParsedData(**orjson.loads(row["parsed_json"]))
+-            ensure_multi_language(parsed_data)
++            parsed_data = ParsedData.model_construct(**orjson.loads(row["parsed_json"]))
++            if needs_multi_language(parsed_data):
++                ensure_multi_language(parsed_data)
+ 
+             target_season = self.search_season
+             if (
+@@ -239,6 +241,11 @@ class TorrentManager:
+             )
+ 
+     async def cache_torrents(self):
++        if self.ready_to_cache:
++            await redis_mark_fresh_torrents(
++                self.media_only_id, self.search_season, self.search_episode
++            )
++
+         file_infos = []
+         for torrent in self.ready_to_cache:
+             self._append_cache_file_infos(file_infos, torrent)
+@@ -270,7 +277,7 @@ class TorrentManager:
+             return
+ 
+         loop = asyncio.get_running_loop()
+-        chunk_size = 20
++        chunk_size = 200
+         tasks = [
+             loop.run_in_executor(
+                 get_executor(),
+diff --git a/comet/services/redis_cache.py b/comet/services/redis_cache.py
+new file mode 100644
+index 0000000..1ebe8ae
+--- /dev/null
++++ b/comet/services/redis_cache.py
+@@ -0,0 +1,409 @@
++import hashlib
++import uuid
++
++import orjson
++
++from comet.core.logger import logger
++from comet.core.models import settings
++
++_redis = None
++TORRENT_CACHE_PREFIX = "comet:tc:"
++RANKED_CACHE_PREFIX = "comet:rc:"
++LOCK_PREFIX = "comet:lock:"
++DEBRID_CACHE_PREFIX = "comet:dc:"
++FIRST_SEARCH_PREFIX = "comet:fs:"
++FRESH_TORRENT_PREFIX = "comet:ft:"
++METADATA_CACHE_PREFIX = "comet:mc:"
++DEFAULT_TTL = 300
++
++
++async def setup_redis():
++    global _redis
++    url = getattr(settings, "REDIS_URL", None)
++    if not url:
++        return
++    try:
++        import redis.asyncio as aioredis
++
++        _redis = aioredis.from_url(url, decode_responses=False)
++        await _redis.ping()
++        logger.log("COMET", f"Redis cache connected: {url}")
++    except Exception as e:
++        logger.warning(f"Redis cache unavailable, falling back to DB only: {e}")
++        _redis = None
++
++
++async def shutdown_redis():
++    global _redis
++    if _redis:
++        await _redis.aclose()
++        _redis = None
++
++
++_settings_hash_cache = {}
++
++
++def _settings_hash(rtn_settings, rtn_ranking, max_size, remove_trash, max_results_per_resolution=0):
++    # model_dump() is expensive; cache the base hash per (id(settings), id(ranking))
++    # and only mix in the cheap scalar params per call.
++    s_id = id(rtn_settings)
++    r_id = id(rtn_ranking)
++    base_key = (s_id, r_id)
++
++    base_bytes = _settings_hash_cache.get(base_key)
++    if base_bytes is None:
++        base_bytes = orjson.dumps(
++            {
++                "s": rtn_settings.model_dump() if hasattr(rtn_settings, "model_dump") else str(rtn_settings),
++                "r": rtn_ranking.model_dump() if hasattr(rtn_ranking, "model_dump") else str(rtn_ranking),
++            },
++            option=orjson.OPT_SORT_KEYS,
++        )
++        _settings_hash_cache[base_key] = base_bytes
++        # Evict old entries to avoid unbounded growth
++        if len(_settings_hash_cache) > 256:
++            _settings_hash_cache.clear()
++            _settings_hash_cache[base_key] = base_bytes
++
++    raw = base_bytes + orjson.dumps(
++        {"ms": max_size, "mr": max_results_per_resolution, "rt": remove_trash},
++        option=orjson.OPT_SORT_KEYS,
++    )
++    return hashlib.md5(raw, usedforsecurity=False).hexdigest()[:12]
++
++
++def _torrent_key(media_id: str, season, episode):
++    return f"{TORRENT_CACHE_PREFIX}{media_id}:{season}:{episode}"
++
++
++def _ranked_key(media_id: str, season, episode, settings_hash: str):
++    return f"{RANKED_CACHE_PREFIX}{media_id}:{season}:{episode}:{settings_hash}"
++
++
++def _serialize_torrent_dict(torrents: dict) -> bytes:
++    serializable = {}
++    for info_hash, t in torrents.items():
++        entry = {
++            "fileIndex": t.get("fileIndex"),
++            "title": t["title"],
++            "seeders": t.get("seeders"),
++            "size": t.get("size"),
++            "tracker": t.get("tracker"),
++            "sources": t.get("sources"),
++        }
++        parsed = t.get("parsed")
++        if parsed is not None:
++            entry["parsed"] = parsed.model_dump() if hasattr(parsed, "model_dump") else parsed
++        serializable[info_hash] = entry
++    return orjson.dumps(serializable)
++
++
++def _deserialize_torrent_dict(data: bytes) -> dict:
++    from RTN import ParsedData
++
++    raw = orjson.loads(data)
++    torrents = {}
++    for info_hash, entry in raw.items():
++        parsed_dict = entry.pop("parsed", None)
++        if parsed_dict is not None:
++            entry["parsed"] = ParsedData.model_construct(**parsed_dict)
++        else:
++            entry["parsed"] = None
++        torrents[info_hash] = entry
++    return torrents
++
++
++def _serialize_ranked(ranked_torrents: dict, torrents: dict) -> bytes:
++    data = {
++        "ranked": list(ranked_torrents.keys()),
++        "torrents": {},
++    }
++    for info_hash in ranked_torrents:
++        t = torrents.get(info_hash, {})
++        entry = {
++            "fileIndex": t.get("fileIndex"),
++            "title": t.get("title", ""),
++            "seeders": t.get("seeders"),
++            "size": t.get("size"),
++            "tracker": t.get("tracker"),
++            "sources": t.get("sources"),
++        }
++        parsed = t.get("parsed")
++        if parsed is not None:
++            entry["parsed"] = parsed.model_dump() if hasattr(parsed, "model_dump") else parsed
++        data["torrents"][info_hash] = entry
++    return orjson.dumps(data)
++
++
++def _deserialize_ranked(data: bytes):
++    from RTN import ParsedData
++
++    raw = orjson.loads(data)
++    ranked_hashes = raw["ranked"]
++    torrents = {}
++    for info_hash, entry in raw["torrents"].items():
++        parsed_dict = entry.pop("parsed", None)
++        if parsed_dict is not None:
++            entry["parsed"] = ParsedData.model_construct(**parsed_dict)
++        else:
++            entry["parsed"] = None
++        torrents[info_hash] = entry
++    return ranked_hashes, torrents
++
++
++async def get_cached_torrents(media_id: str, season, episode):
++    if not _redis:
++        return None
++    try:
++        data = await _redis.get(_torrent_key(media_id, season, episode))
++        if data:
++            return _deserialize_torrent_dict(data)
++    except Exception:
++        pass
++    return None
++
++
++async def set_cached_torrents(media_id: str, season, episode, torrents: dict, ttl: int = DEFAULT_TTL):
++    if not _redis or not torrents:
++        return
++    try:
++        key = _torrent_key(media_id, season, episode)
++        await _redis.set(key, _serialize_torrent_dict(torrents), ex=ttl)
++    except Exception:
++        pass
++
++
++async def get_cached_ranked(
++    media_id, season, episode, rtn_settings, rtn_ranking, max_size, remove_trash,
++    max_results_per_resolution=0,
++):
++    if not _redis:
++        return None, None
++    try:
++        sh = _settings_hash(rtn_settings, rtn_ranking, max_size, remove_trash, max_results_per_resolution)
++        data = await _redis.get(_ranked_key(media_id, season, episode, sh))
++        if data:
++            return _deserialize_ranked(data)
++    except Exception:
++        pass
++    return None, None
++
++
++async def set_cached_ranked(
++    media_id, season, episode, rtn_settings, rtn_ranking, max_size, remove_trash,
++    max_results_per_resolution, ranked_torrents, torrents, ttl: int = DEFAULT_TTL,
++):
++    if not _redis or not ranked_torrents:
++        return
++    try:
++        sh = _settings_hash(rtn_settings, rtn_ranking, max_size, remove_trash, max_results_per_resolution)
++        key = _ranked_key(media_id, season, episode, sh)
++        await _redis.set(key, _serialize_ranked(ranked_torrents, torrents), ex=ttl)
++    except Exception:
++        pass
++
++
++def is_redis_available():
++    return _redis is not None
++
++
++# --- Distributed Lock via Redis ---
++
++async def redis_lock_acquire(lock_key: str, timeout: int) -> str | None:
++    if not _redis:
++        return None
++    instance_id = str(uuid.uuid4())
++    try:
++        key = f"{LOCK_PREFIX}{lock_key}"
++        acquired = await _redis.set(key, instance_id, nx=True, ex=timeout)
++        if acquired:
++            return instance_id
++    except Exception:
++        pass
++    return None
++
++
++async def redis_lock_release(lock_key: str, instance_id: str):
++    if not _redis:
++        return
++    try:
++        key = f"{LOCK_PREFIX}{lock_key}"
++        # Only release if we own the lock (atomic check-and-delete via Lua)
++        script = """
++        if redis.call("get", KEYS[1]) == ARGV[1] then
++            return redis.call("del", KEYS[1])
++        else
++            return 0
++        end
++        """
++        await _redis.eval(script, 1, key, instance_id)
++    except Exception:
++        pass
++
++
++async def redis_lock_refresh(lock_key: str, instance_id: str, timeout: int) -> bool:
++    if not _redis:
++        return False
++    try:
++        key = f"{LOCK_PREFIX}{lock_key}"
++        script = """
++        if redis.call("get", KEYS[1]) == ARGV[1] then
++            return redis.call("expire", KEYS[1], ARGV[2])
++        else
++            return 0
++        end
++        """
++        result = await _redis.eval(script, 1, key, instance_id, str(timeout))
++        return result == 1
++    except Exception:
++        return False
++
++
++async def redis_lock_exists(lock_key: str) -> bool:
++    if not _redis:
++        return False
++    try:
++        key = f"{LOCK_PREFIX}{lock_key}"
++        return bool(await _redis.exists(key))
++    except Exception:
++        return False
++
++
++# --- First Search via Redis ---
++
++async def redis_first_search(media_id: str, ttl: int = 86400) -> bool | None:
++    """Returns True if this is the first search (key was set), False if already searched, None if Redis unavailable."""
++    if not _redis:
++        return None
++    try:
++        key = f"{FIRST_SEARCH_PREFIX}{media_id}"
++        result = await _redis.set(key, b"1", nx=True, ex=ttl)
++        return bool(result)
++    except Exception:
++        return None
++
++
++# --- Fresh Torrent Count via Redis ---
++
++def _fresh_torrent_key(media_id: str, season, episode):
++    return f"{FRESH_TORRENT_PREFIX}{media_id}:{season}:{episode}"
++
++
++async def redis_mark_fresh_torrents(media_id: str, season, episode, ttl: int = None):
++    """Mark that fresh torrents exist for this media. TTL = LIVE_TORRENT_CACHE_TTL."""
++    if not _redis:
++        return
++    if ttl is None:
++        ttl = settings.LIVE_TORRENT_CACHE_TTL
++    if ttl < 0:
++        ttl = 86400 * 365  # effectively never expires
++    try:
++        key = _fresh_torrent_key(media_id, season, episode)
++        await _redis.set(key, b"1", ex=ttl)
++    except Exception:
++        pass
++
++
++async def redis_has_fresh_torrents(media_id: str, season, episode) -> bool | None:
++    """Check if fresh torrents exist. Returns True/False or None if Redis unavailable."""
++    if not _redis:
++        return None
++    try:
++        key = _fresh_torrent_key(media_id, season, episode)
++        return bool(await _redis.exists(key))
++    except Exception:
++        return None
++
++
++# --- Debrid Availability Cache via Redis ---
++
++def _debrid_cache_key(debrid_service: str, season, episode, info_hash: str):
++    return f"{DEBRID_CACHE_PREFIX}{debrid_service}:{season}:{episode}:{info_hash}"
++
++
++async def redis_get_debrid_availability(
++    debrid_service: str, info_hashes: list, season=None, episode=None
++) -> list | None:
++    """Check Redis for cached debrid availability. Returns list of row-like dicts or None."""
++    if not _redis:
++        return None
++    try:
++        if not info_hashes:
++            return []
++        keys = [_debrid_cache_key(debrid_service, season, episode, ih) for ih in info_hashes]
++        results = await _redis.mget(*keys)
++        found = []
++        for ih, data in zip(info_hashes, results):
++            if data is not None:
++                entry = orjson.loads(data)
++                entry["info_hash"] = ih
++                found.append(entry)
++        if not found:
++            return None
++        return found
++    except Exception:
++        return None
++
++
++async def redis_set_debrid_availability(
++    debrid_service: str, rows: list, season=None, episode=None, ttl: int = None
++):
++    """Cache debrid availability rows as individual keys with TTL."""
++    if not _redis or not rows:
++        return
++    if ttl is None:
++        ttl = settings.DEBRID_CACHE_TTL
++    try:
++        pipe = _redis.pipeline()
++        for row in rows:
++            ih = row["info_hash"]
++            key = _debrid_cache_key(debrid_service, season, episode, ih)
++            entry = {
++                "file_index": row.get("file_index"),
++                "title": row.get("title"),
++                "size": row.get("size"),
++                "parsed": row.get("parsed"),
++            }
++            pipe.set(key, orjson.dumps(entry), ex=ttl)
++        await pipe.execute()
++    except Exception:
++        pass
++
++
++# --- Metadata Cache via Redis ---
++
++def _metadata_cache_key(media_id: str):
++    return f"{METADATA_CACHE_PREFIX}{media_id}"
++
++
++async def redis_get_metadata(media_id: str) -> dict | None:
++    """Get cached metadata from Redis. Returns dict with title, year, year_end, aliases or None."""
++    if not _redis:
++        return None
++    try:
++        key = _metadata_cache_key(media_id)
++        data = await _redis.get(key)
++        if data:
++            return orjson.loads(data)
++    except Exception:
++        pass
++    return None
++
++
++async def redis_set_metadata(media_id: str, metadata: dict, aliases: dict, ttl: int = None):
++    """Cache metadata in Redis."""
++    if not _redis:
++        return
++    if ttl is None:
++        ttl = settings.METADATA_CACHE_TTL
++    try:
++        key = _metadata_cache_key(media_id)
++        data = orjson.dumps({
++            "title": metadata["title"],
++            "year": metadata.get("year"),
++            "year_end": metadata.get("year_end"),
++            "aliases": aliases,
++        })
++        await _redis.set(key, data, ex=ttl)
++    except Exception:
++        pass
+diff --git a/comet/utils/parsing.py b/comet/utils/parsing.py
+index 5cced75..19d8dfd 100644
+--- a/comet/utils/parsing.py
++++ b/comet/utils/parsing.py
+@@ -6,6 +6,14 @@ SCRAPE_URL_MODE_BOTH = "both"
+ SCRAPE_URL_MODES = frozenset((SCRAPE_URL_MODE_BOTH, "live", "background"))
+ 
+ 
++def needs_multi_language(parsed: ParsedData) -> bool:
++    """Check if ensure_multi_language would actually mutate this parsed object."""
++    languages = parsed.languages
++    return (len(languages) > 1 or parsed.dubbed) and not (
++        languages and languages[0] == "multi"
++    )
++
++
+ def ensure_multi_language(parsed: ParsedData):
+     languages = parsed.languages
+ 
+@@ -15,13 +23,9 @@ def ensure_multi_language(parsed: ParsedData):
+     if languages and languages[0] == "multi":
+         return
+ 
+-    try:
+-        languages.remove("multi")
+-    except ValueError:
+-        pass
+-
+-    languages.insert(0, "multi")
+-    parsed.languages = languages
++    new_languages = [lang for lang in languages if lang != "multi"]
++    new_languages.insert(0, "multi")
++    parsed.languages = new_languages
+ 
+ 
+ def is_video(title: str):
+diff --git a/elfhosted-cpu-optimization.patch b/elfhosted-cpu-optimization.patch
+new file mode 100644
+index 0000000..3267371
+--- /dev/null
++++ b/elfhosted-cpu-optimization.patch
+@@ -0,0 +1,1308 @@
++From 03cc8f08dc167db318005cfc9cbb0ad3057dbdc0 Mon Sep 17 00:00:00 2001
++From: Elfbot <elfbot@elfhosted.com>
++Date: Tue, 24 Mar 2026 14:41:21 +1300
++Subject: [PATCH] perf: ElfHosted CPU optimization patches rebased onto v2.53.0
++
++Rebased all CPU optimization patches from v2.52.0 to v2.53.0, adapting
++for upstream column renames (parsed_json, sources_json, updated_at,
++aliases_json), table renames (media_metadata_cache), new schema migration
++system, and Rust-powered torrent-parse-rank dependency.
++
++Includes fix for unbounded Redis debrid cache growth (per-hash keys
++with individual TTL instead of single hash).
++
++Removed pre-cap ranking optimization (RANK_CANDIDATE_MULTIPLIER) as the
++Rust-backed RTN makes it unnecessary.
++
++Fix Jinja2 template cache crash on Python 3.13 (unhashable dict in
++LRU cache key).
++
++Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
++---
++ comet/api/app.py                |   3 +
++ comet/api/endpoints/config.py   |   2 +
++ comet/api/endpoints/stream.py   | 101 ++++++--
++ comet/core/execution.py         |  26 +-
++ comet/core/models.py            |  12 +-
++ comet/debrid/stremthru.py       |  16 +-
++ comet/metadata/manager.py       |  45 +++-
++ comet/scrapers/comet.py         |   8 +-
++ comet/services/cache_state.py   |  18 ++
++ comet/services/debrid.py        |  12 +-
++ comet/services/debrid_cache.py  |  37 +++
++ comet/services/filtering.py     |  35 +--
++ comet/services/lock.py          |  57 +++++
++ comet/services/orchestration.py |  15 +-
++ comet/services/redis_cache.py   | 409 ++++++++++++++++++++++++++++++++
++ comet/utils/parsing.py          |  18 +-
++ pyproject.toml                  |   1 +
++ 17 files changed, 713 insertions(+), 102 deletions(-)
++ create mode 100644 comet/services/redis_cache.py
++
++diff --git a/comet/api/app.py b/comet/api/app.py
++index 4a1ec29..feefb6f 100644
++--- a/comet/api/app.py
+++++ b/comet/api/app.py
++@@ -19,6 +19,7 @@ from comet.core.database import (cleanup_expired_kodi_setup_codes,
++                                  cleanup_expired_locks, setup_database,
++                                  teardown_database)
++ from comet.core.execution import setup_executor, shutdown_executor
+++from comet.services.redis_cache import setup_redis, shutdown_redis
++ from comet.core.logger import logger
++ from comet.core.models import STREMIO_API_PREFIX, settings
++ from comet.services.anime import anime_mapper
++@@ -58,6 +59,7 @@ async def lifespan(app: FastAPI):
++ 
++     await setup_database()
++     setup_executor()
+++    await setup_redis()
++     await http_client_manager.init()
++ 
++     if settings.DOWNLOAD_GENERIC_TRACKERS:
++@@ -175,6 +177,7 @@ async def lifespan(app: FastAPI):
++         await network_manager.close_all()
++         await http_client_manager.close()
++ 
+++        await shutdown_redis()
++         await teardown_database()
++         shutdown_executor()
++ 
++diff --git a/comet/api/endpoints/config.py b/comet/api/endpoints/config.py
++index 3acfae4..2cd5c09 100644
++--- a/comet/api/endpoints/config.py
+++++ b/comet/api/endpoints/config.py
++@@ -13,6 +13,8 @@ from comet.utils.signed_session import (derive_session_secret,
++ 
++ router = APIRouter()
++ templates = Jinja2Templates("comet/templates")
+++templates.env.auto_reload = False
+++templates.env.cache = None
++ CONFIGURE_SESSION_COOKIE = "configure_session"
++ CONFIGURE_PAGE_PASSWORD = settings.CONFIGURE_PAGE_PASSWORD
++ CONFIGURE_PAGE_PASSWORD_ENABLED = bool(CONFIGURE_PAGE_PASSWORD)
++diff --git a/comet/api/endpoints/stream.py b/comet/api/endpoints/stream.py
++index 9fe2325..a73fc33 100644
++--- a/comet/api/endpoints/stream.py
+++++ b/comet/api/endpoints/stream.py
++@@ -30,6 +30,11 @@ from comet.utils.formatting import (format_chilllink, format_title,
++ from comet.utils.http_client import http_client_manager
++ from comet.utils.network import get_client_ip
++ from comet.utils.parsing import parse_media_id
+++from comet.services.redis_cache import (
+++    get_cached_ranked, set_cached_ranked,
+++    get_cached_torrents as redis_get_torrents,
+++    set_cached_torrents as redis_set_torrents,
+++)
++ 
++ streams = APIRouter()
++ STREMIO_API_PREFIX = settings.STREMIO_API_PREFIX
++@@ -601,7 +606,16 @@ async def stream(
++         reject_unknown_episode_files=strict_episode_matching,
++     )
++ 
++-    await torrent_manager.get_cached_torrents()
+++    redis_torrents = await redis_get_torrents(media_only_id, search_season, search_episode)
+++    if redis_torrents is not None:
+++        torrent_manager.torrents = redis_torrents
+++        torrent_manager.primary_cached = True
+++    else:
+++        await torrent_manager.get_cached_torrents()
+++        await redis_set_torrents(
+++            media_only_id, search_season, search_episode,
+++            torrent_manager.torrents, settings.REDIS_CACHE_TTL,
+++        )
++     torrent_count = len(torrent_manager.torrents)
++     logger.log("SCRAPER", f"📦 Found cached torrents: {torrent_count}")
++     primary_cached = torrent_manager.primary_cached
++@@ -661,7 +675,7 @@ async def stream(
++             }
++         )
++ 
++-    if cache_result.should_scrape_background and not force_scrape_now:
+++    if cache_result.should_scrape_background and not force_scrape_now and not settings.DISABLE_BACKGROUND_SCRAPE:
++         logger.log(
++             "SCRAPER",
++             f"🔄 Starting background scrape for {log_title} (state={cache_result.state.value})",
++@@ -675,26 +689,38 @@ async def stream(
++             session,
++         )
++ 
+++    stream_timeout = settings.STREAM_REQUEST_TIMEOUT
+++    _deadline = (asyncio.get_event_loop().time() + stream_timeout) if stream_timeout else None
+++
+++    def _remaining_timeout():
+++        if _deadline is None:
+++            return None
+++        remaining = _deadline - asyncio.get_event_loop().time()
+++        return max(remaining, 0.1)
+++
++     if cache_result.should_scrape_now or force_scrape_now:
++         logger.log("SCRAPER", f"🔎 Starting new search for {log_title}")
++         try:
++-            if use_account_scrape:
++-                scrape_result, warmup_result = await asyncio.gather(
++-                    torrent_manager.scrape_torrents(),
++-                    ensure_account_snapshot_ready(session, debrid_entries, ip),
++-                    return_exceptions=True,
+++            async with asyncio.timeout(_remaining_timeout()):
+++                if use_account_scrape:
+++                    scrape_result, warmup_result = await asyncio.gather(
+++                        torrent_manager.scrape_torrents(),
+++                        ensure_account_snapshot_ready(session, debrid_entries, ip),
+++                        return_exceptions=True,
+++                    )
+++                    if isinstance(scrape_result, Exception):
+++                        raise scrape_result
+++                    if isinstance(warmup_result, Exception):
+++                        raise warmup_result
+++                    account_snapshot_ready = True
+++                else:
+++                    await torrent_manager.scrape_torrents()
+++                logger.log(
+++                    "SCRAPER",
+++                    f"📥 Torrents after global RTN filtering: {len(torrent_manager.torrents)}",
++                 )
++-                if isinstance(scrape_result, Exception):
++-                    raise scrape_result
++-                if isinstance(warmup_result, Exception):
++-                    raise warmup_result
++-                account_snapshot_ready = True
++-            else:
++-                await torrent_manager.scrape_torrents()
++-            logger.log(
++-                "SCRAPER",
++-                f"📥 Torrents after global RTN filtering: {len(torrent_manager.torrents)}",
++-            )
+++        except TimeoutError:
+++            logger.log("SCRAPER", f"⏰ Stream request timed out for {log_title}")
++         finally:
++             await cache_manager.release_lock()
++ 
++@@ -849,13 +875,40 @@ async def stream(
++ 
++     initial_torrent_count = len(torrent_manager.torrents)
++ 
++-    await torrent_manager.rank_torrents(
++-        config["rtnSettings"],
++-        config["rtnRanking"],
++-        0,
++-        config["maxSize"],
++-        config["removeTrash"],
+++    rtn_settings = config["rtnSettings"]
+++    rtn_ranking = config["rtnRanking"]
+++    max_size = config["maxSize"]
+++    remove_trash = config["removeTrash"]
+++
+++    # Effective per-resolution limit: user config wins, server cap as floor
+++    user_max = config["maxResultsPerResolution"]
+++    server_max = settings.MAX_RESULTS_PER_RESOLUTION
+++    if user_max > 0 and server_max > 0:
+++        effective_max_results = min(user_max, server_max)
+++    elif user_max > 0:
+++        effective_max_results = user_max
+++    else:
+++        effective_max_results = server_max  # 0 means unlimited
+++
+++    cached_ranked, cached_ranked_torrents = await get_cached_ranked(
+++        media_only_id, search_season, search_episode,
+++        rtn_settings, rtn_ranking, max_size, remove_trash,
+++        effective_max_results,
++     )
+++    if cached_ranked is not None:
+++        torrent_manager.ranked_torrents = {h: True for h in cached_ranked}
+++        torrent_manager.torrents.update(cached_ranked_torrents)
+++    else:
+++        await torrent_manager.rank_torrents(
+++            rtn_settings, rtn_ranking, effective_max_results, max_size, remove_trash,
+++        )
+++        await set_cached_ranked(
+++            media_only_id, search_season, search_episode,
+++            rtn_settings, rtn_ranking, max_size, remove_trash,
+++            effective_max_results,
+++            torrent_manager.ranked_torrents, torrent_manager.torrents,
+++            settings.REDIS_CACHE_TTL,
+++        )
++     logger.log(
++         "SCRAPER",
++         f"⚖️  Torrents after user RTN filtering: {len(torrent_manager.ranked_torrents)}/{initial_torrent_count}",
++diff --git a/comet/core/execution.py b/comet/core/execution.py
++index 1946f63..18a8bba 100644
++--- a/comet/core/execution.py
+++++ b/comet/core/execution.py
++@@ -1,33 +1,19 @@
++ import atexit
++-import multiprocessing
++-import signal
++-from concurrent.futures import ProcessPoolExecutor
+++import os
+++from concurrent.futures import ThreadPoolExecutor
++ 
++ from comet.core.models import settings
++ 
++-_mp_context = None
++-try:
++-    _mp_context = multiprocessing.get_context("forkserver")
++-except ValueError:
++-    _mp_context = multiprocessing.get_context("spawn")
++-
++ app_executor = None
++ max_workers = settings.EXECUTOR_MAX_WORKERS
++-# if max_workers is None:
++-#     cpu_count = os.cpu_count() or 1
++-#     max_workers = min(cpu_count, 4)
++-
++-
++-def worker_initializer():
++-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+++if max_workers is None or max_workers < 1:
+++    cpu_count = os.cpu_count() or 1
+++    max_workers = min(cpu_count, 4)
++ 
++ 
++ def setup_executor():
++     global app_executor
++-
++-    app_executor = ProcessPoolExecutor(
++-        max_workers=max_workers, mp_context=_mp_context, initializer=worker_initializer
++-    )
+++    app_executor = ThreadPoolExecutor(max_workers=max_workers)
++ 
++ 
++ def shutdown_executor():
++diff --git a/comet/core/models.py b/comet/core/models.py
++index de331ae..c6a6947 100644
++--- a/comet/core/models.py
+++++ b/comet/core/models.py
++@@ -65,7 +65,7 @@ class AppSettings(BaseSettings):
++     FASTAPI_WORKERS: Optional[int] = 1
++     USE_GUNICORN: Optional[bool] = True
++     GUNICORN_PRELOAD_APP: Optional[bool] = True
++-    EXECUTOR_MAX_WORKERS: Optional[int] = 1
+++    EXECUTOR_MAX_WORKERS: Optional[int] = None
++     ADMIN_DASHBOARD_PASSWORD: Optional[str] = "".join(
++         random.choices(string.ascii_letters + string.digits, k=16)
++     )
++@@ -216,7 +216,11 @@ class AppSettings(BaseSettings):
++     RATELIMIT_MAX_RETRIES: Optional[int] = 3
++     RATELIMIT_RETRY_BASE_DELAY: Optional[float] = 1.0
++     RTN_FILTER_DEBUG: Optional[bool] = False
++-    FILTER_PARSE_CACHE_SIZE: Optional[int] = 10000
+++    MAX_RESULTS_PER_RESOLUTION: Optional[int] = 0  # Server-side cap, 0 = unlimited
+++    STREAM_REQUEST_TIMEOUT: Optional[int] = 0  # Overall timeout in seconds for stream requests, 0 = unlimited
+++    DISABLE_BACKGROUND_SCRAPE: Optional[bool] = False  # Skip background scrapes (stale/first_search)
+++    MAX_DEBRID_FILES_PER_CHECK: Optional[int] = 0  # Cap files parsed during debrid availability, 0 = unlimited
+++    FILTER_PARSE_CACHE_SIZE: Optional[int] = 50000
++     FILTER_PARSE_CACHE_SHARDS: Optional[int] = 8
++     FILTER_PARSE_CACHE_DEDUP_INFLIGHT: Optional[bool] = True
++     HTTP_CACHE_ENABLED: Optional[bool] = False
++@@ -231,6 +235,8 @@ class AppSettings(BaseSettings):
++     HTTP_CACHE_CONFIGURE_TTL: Optional[int] = 86400
++     DOWNLOAD_GENERIC_TRACKERS: Optional[bool] = False
++     SMART_LANGUAGE_DETECTION: Optional[bool] = False
+++    REDIS_URL: Optional[str] = None
+++    REDIS_CACHE_TTL: Optional[int] = 300
++ 
++     # CometNet P2P Network Configuration
++     COMETNET_ENABLED: Optional[bool] = False
++@@ -339,7 +345,7 @@ class AppSettings(BaseSettings):
++     @field_validator("EXECUTOR_MAX_WORKERS", mode="before")
++     def normalize_executor_workers(cls, v):
++         if v is None or v == "" or str(v).lower() == "none":
++-            return 1
+++            return None
++         return v
++ 
++     @field_validator(
++diff --git a/comet/debrid/stremthru.py b/comet/debrid/stremthru.py
++index be9b2d8..e518645 100644
++--- a/comet/debrid/stremthru.py
+++++ b/comet/debrid/stremthru.py
++@@ -2,7 +2,7 @@ import asyncio
++ from urllib.parse import quote, unquote
++ 
++ import aiohttp
++-from RTN import normalize_title, parse, title_match
+++from RTN import normalize_title, title_match
++ 
++ from comet.core.execution import get_executor
++ from comet.core.logger import logger
++@@ -10,16 +10,20 @@ from comet.core.models import settings
++ from comet.debrid.exceptions import DebridAuthError, DebridLinkGenerationError
++ from comet.metadata.episode_index import EpisodeIndexService
++ from comet.services.debrid_cache import cache_availability
++-from comet.services.filtering import quick_alias_match
+++from comet.services.filtering import _parse_with_cache, quick_alias_match
++ from comet.services.torrent_manager import torrent_update_queue
++-from comet.utils.parsing import (ensure_multi_language, is_video,
+++from comet.utils.parsing import (ensure_multi_language, needs_multi_language, is_video,
++                                  match_parsed_episode_target, parse_media_id)
++ 
++ 
++ def batch_parse(filenames):
++-    parsed_results = [parse(f) for f in filenames]
++-    for parsed in parsed_results:
++-        ensure_multi_language(parsed)
+++    parsed_results = []
+++    for f in filenames:
+++        parsed = _parse_with_cache(f)
+++        if needs_multi_language(parsed):
+++            parsed = parsed.model_copy()
+++            ensure_multi_language(parsed)
+++        parsed_results.append(parsed)
++     return parsed_results
++ 
++ 
++diff --git a/comet/metadata/manager.py b/comet/metadata/manager.py
++index 2f499d8..2c5c9d0 100644
++--- a/comet/metadata/manager.py
+++++ b/comet/metadata/manager.py
++@@ -9,6 +9,7 @@ from comet.core.database import (build_upsert_assignments, database,
++ from comet.core.logger import logger
++ from comet.core.models import settings
++ from comet.services.anime import anime_mapper
+++from comet.services.redis_cache import redis_get_metadata, redis_set_metadata
++ from comet.utils.parsing import parse_media_id
++ 
++ from .imdb import get_imdb_metadata
++@@ -163,6 +164,20 @@ class MetadataScraper:
++         return aliases if isinstance(aliases, dict) else {}
++ 
++     async def get_cached(self, media_id: str, season: int, episode: int):
+++        # Try Redis first
+++        cached = await redis_get_metadata(media_id)
+++        if cached is not None:
+++            return (
+++                {
+++                    "title": cached["title"],
+++                    "year": cached.get("year"),
+++                    "year_end": cached.get("year_end"),
+++                    "season": season,
+++                    "episode": episode,
+++                },
+++                cached["aliases"],
+++            )
+++
++         row = await database.fetch_one(
++             _CACHE_SELECT_QUERY,
++             {
++@@ -173,16 +188,19 @@ class MetadataScraper:
++         if row is None:
++             return None
++ 
++-        return (
++-            {
++-                "title": row["title"],
++-                "year": row["year"],
++-                "year_end": row["year_end"],
++-                "season": season,
++-                "episode": episode,
++-            },
++-            self._load_cached_aliases(row["aliases_json"]),
++-        )
+++        metadata = {
+++            "title": row["title"],
+++            "year": row["year"],
+++            "year_end": row["year_end"],
+++            "season": season,
+++            "episode": episode,
+++        }
+++        aliases = self._load_cached_aliases(row["aliases_json"])
+++
+++        # Backfill Redis
+++        await redis_set_metadata(media_id, metadata, aliases)
+++
+++        return (metadata, aliases)
++ 
++     async def cache_metadata(
++         self,
++@@ -208,7 +226,12 @@ class MetadataScraper:
++             params["metadata_stale_before"] = current_time - settings.METADATA_CACHE_TTL
++ 
++         row = await database.fetch_one(query, params, force_primary=True)
++-        return self._load_cached_aliases(row["aliases_json"]) if row is not None else {}
+++        aliases_result = self._load_cached_aliases(row["aliases_json"]) if row is not None else {}
+++
+++        # Write-through to Redis
+++        await redis_set_metadata(media_id, metadata, aliases_result)
+++
+++        return aliases_result
++ 
++     def normalize_metadata(self, metadata: dict, season: int, episode: int):
++         if not metadata:
++diff --git a/comet/scrapers/comet.py b/comet/scrapers/comet.py
++index 2fe1a5b..9e0a93c 100644
++--- a/comet/scrapers/comet.py
+++++ b/comet/scrapers/comet.py
++@@ -29,10 +29,6 @@ class CometScraper(BaseScraper):
++                     else None
++                 )
++ 
++-                tracker = None
++-                if "🔎 " in title_full:
++-                    tracker = title_full.split("🔎 ")[1].split("\n")[0]
++-
++                 torrents.append(
++                     {
++                         "title": title,
++@@ -40,9 +36,7 @@ class CometScraper(BaseScraper):
++                         "fileIndex": torrent.get("fileIdx", None),
++                         "seeders": seeders,
++                         "size": torrent["behaviorHints"].get("videoSize"),
++-                        "tracker": f"Comet|{tracker}"
++-                        if tracker is not None
++-                        else "Comet",
+++                        "tracker": "CometNet|ElfHosted",
++                         "sources": torrent.get("sources", []),
++                     }
++                 )
++diff --git a/comet/services/cache_state.py b/comet/services/cache_state.py
++index f99013a..c1b2722 100644
++--- a/comet/services/cache_state.py
+++++ b/comet/services/cache_state.py
++@@ -8,6 +8,8 @@ from comet.core.database import (build_json_list_membership_predicate,
++ from comet.core.logger import logger
++ from comet.core.models import settings
++ from comet.services.lock import DistributedLock
+++from comet.services.redis_cache import (redis_first_search,
+++                                        redis_has_fresh_torrents)
++ from comet.utils.media_ids import normalize_cache_media_ids
++ from comet.utils.torrent_cache import normalize_search_params
++ 
++@@ -111,6 +113,16 @@ class CacheStateManager:
++         Returns 1 if any fresh torrent exists, otherwise 0.
++         If TTL is -1 (never expires), checks for any cached torrent.
++         """
+++        # Try Redis first for each cache_media_id
+++        for cache_media_id in self.cache_media_ids:
+++            result = await redis_has_fresh_torrents(
+++                cache_media_id, self.search_season, self.search_episode
+++            )
+++            if result is True:
+++                return 1
+++            # result is None means Redis unavailable, fall through to DB
+++
+++        # Fall back to DB
++         min_timestamp = None
++         if settings.LIVE_TORRENT_CACHE_TTL >= 0:
++             min_timestamp = time.time() - settings.LIVE_TORRENT_CACHE_TTL
++@@ -163,6 +175,12 @@ class CacheStateManager:
++         """
++         Check if this is the first search for this media_id.
++         """
+++        # Try Redis first (single atomic SETNX)
+++        redis_result = await redis_first_search(self.media_id)
+++        if redis_result is not None:
+++            return redis_result
+++
+++        # Fall back to DB
++         current_time = time.time()
++         insert_params = {
++             "media_id": self.media_id,
++diff --git a/comet/services/debrid.py b/comet/services/debrid.py
++index e3c562a..97eb57d 100644
++--- a/comet/services/debrid.py
+++++ b/comet/services/debrid.py
++@@ -7,7 +7,7 @@ from comet.debrid.manager import retrieve_debrid_availability
++ from comet.services.debrid_cache import (cache_availability,
++                                          get_cached_availability,
++                                          get_cached_availability_any_service)
++-from comet.utils.parsing import ensure_multi_language
+++from comet.utils.parsing import ensure_multi_language, needs_multi_language
++ 
++ 
++ class DebridService:
++@@ -41,9 +41,12 @@ class DebridService:
++         original: ParsedData | None, incoming: ParsedData | None
++     ) -> ParsedData | None:
++         if incoming is None:
+++            if original is not None and needs_multi_language(original):
+++                ensure_multi_language(original)
++             return original
++         if original is None:
++-            ensure_multi_language(incoming)
+++            if needs_multi_language(incoming):
+++                ensure_multi_language(incoming)
++             return incoming
++ 
++         merged = incoming
++@@ -69,7 +72,8 @@ class DebridService:
++         ):
++             DebridService._backfill_attr(merged, original, attr)
++ 
++-        ensure_multi_language(merged)
+++        if needs_multi_language(merged):
+++            ensure_multi_language(merged)
++         return merged
++ 
++     async def get_and_cache_availability(
++@@ -166,7 +170,7 @@ class DebridService:
++                     torrent["size"] = row["size"]
++ 
++                 if row["parsed"] is not None:
++-                    cached_parsed = ParsedData(**orjson.loads(row["parsed"]))
+++                    cached_parsed = ParsedData.model_construct(**orjson.loads(row["parsed"]))
++                     merged_parsed = self._merge_parsed(
++                         torrent.get("parsed"), cached_parsed
++                     )
++diff --git a/comet/services/debrid_cache.py b/comet/services/debrid_cache.py
++index cfc1f5a..509611f 100644
++--- a/comet/services/debrid_cache.py
+++++ b/comet/services/debrid_cache.py
++@@ -5,6 +5,8 @@ from comet.core.database import (build_distinct_from_predicate,
++                                  build_scope_lookup_params, build_scope_params,
++                                  build_upsert_assignments, encode_json_param)
++ from comet.core.models import database, settings
+++from comet.services.redis_cache import (redis_get_debrid_availability,
+++                                        redis_set_debrid_availability)
++ from comet.utils.parsing import default_dump
++ 
++ DEBRID_UPDATE_INTERVAL = (
++@@ -100,6 +102,20 @@ async def cache_availability(debrid_service: str, availability: list):
++         for file in availability
++     ]
++ 
+++    # Write-through to Redis (group by season/episode)
+++    by_se = {}
+++    for val in values:
+++        se_key = (val.get("season"), val.get("episode"))
+++        by_se.setdefault(se_key, []).append({
+++            "info_hash": val["info_hash"],
+++            "file_index": val.get("file_index"),
+++            "title": val.get("title"),
+++            "size": val.get("size"),
+++            "parsed": val.get("parsed_json"),
+++        })
+++    for (s, e), rows in by_se.items():
+++        await redis_set_debrid_availability(debrid_service, rows, season=s, episode=e)
+++
++     await database.execute_many(CACHE_AVAILABILITY_QUERY, values)
++ 
++ 
++@@ -109,6 +125,13 @@ async def get_cached_availability(
++     season: int | None = None,
++     episode: int | None = None,
++ ):
+++    # Try Redis first
+++    redis_results = await redis_get_debrid_availability(
+++        debrid_service, info_hashes, season, episode
+++    )
+++    if redis_results is not None:
+++        return redis_results
+++
++     select_clause = "SELECT info_hash, file_index, title, size, parsed_json AS parsed"
++ 
++     min_timestamp = time.time() - settings.DEBRID_CACHE_TTL
++@@ -160,6 +183,20 @@ async def get_cached_availability(
++         """
++         results = await database.fetch_all(query, params)
++ 
+++    # Backfill Redis with DB results
+++    if results:
+++        redis_rows = [
+++            {
+++                "info_hash": r["info_hash"],
+++                "file_index": r["file_index"],
+++                "title": r["title"],
+++                "size": r["size"],
+++                "parsed": r["parsed"],
+++            }
+++            for r in results
+++        ]
+++        await redis_set_debrid_availability(debrid_service, redis_rows, season, episode)
+++
++     return results
++ 
++ 
++diff --git a/comet/services/filtering.py b/comet/services/filtering.py
++index c7cc424..c335aee 100644
++--- a/comet/services/filtering.py
+++++ b/comet/services/filtering.py
++@@ -63,12 +63,6 @@ def _parse_cache_shard_for(title: str):
++     return shard_idx, _parse_cache[shard_idx], _PARSE_CACHE_SHARD_SIZES[shard_idx]
++ 
++ 
++-def _clone_parsed(parsed):
++-    if hasattr(parsed, "model_copy"):
++-        return parsed.model_copy(deep=True)
++-    return parsed.copy(deep=True)
++-
++-
++ def _parse_with_cache(title: str):
++     if _PARSE_CACHE_SIZE <= 0 or _PARSE_CACHE_EFFECTIVE_SHARDS <= 0:
++         return parse(title)
++@@ -88,13 +82,12 @@ def _parse_with_cache_simple(title: str, shard: _ParseCacheShard, max_size: int)
++         cached = shard.data.get(title)
++         if cached is not None:
++             shard.data.move_to_end(title)
++-            return _clone_parsed(cached)
+++            return cached
++ 
++     parsed = parse(title)
++-    cached = _clone_parsed(parsed)
++ 
++     with shard.lock:
++-        shard.data[title] = cached
+++        shard.data[title] = parsed
++         if len(shard.data) > max_size:
++             shard.data.popitem(last=False)
++ 
++@@ -109,7 +102,7 @@ def _parse_with_cache_dedup(title: str, shard: _ParseCacheShard, max_size: int):
++         cached = shard.data.get(title)
++         if cached is not None:
++             shard.data.move_to_end(title)
++-            return _clone_parsed(cached)
+++            return cached
++ 
++         inflight_event = shard.inflight.get(title)
++         if inflight_event is None:
++@@ -125,7 +118,7 @@ def _parse_with_cache_dedup(title: str, shard: _ParseCacheShard, max_size: int):
++             cached = shard.data.get(title)
++             if cached is not None:
++                 shard.data.move_to_end(title)
++-                return _clone_parsed(cached)
+++                return cached
++ 
++         return parse(title)
++ 
++@@ -140,9 +133,8 @@ def _do_parse_and_cache(
++ ):
++     try:
++         parsed = parse(title)
++-        cached = _clone_parsed(parsed)
++         with shard.lock:
++-            shard.data[title] = cached
+++            shard.data[title] = parsed
++             if len(shard.data) > max_size:
++                 shard.data.popitem(last=False)
++             shard.inflight.pop(title, None)
++@@ -228,15 +220,26 @@ def filter_worker(
++             _log_exclusion(f"❌ Rejected (Parse Error) | {torrent_title}")
++             continue
++ 
+++        # Only shallow-copy when language mutation is actually needed
+++        copied = False
+++
++         if parsed.parsed_title and country_aliases:
++             language = country_aliases.get(scrub(parsed.parsed_title))
++             if language and language not in parsed.languages:
++                 _log_exclusion(
++                     f"🏷️ Added Language (Alias) | {torrent_title} | {language}"
++                 )
++-                parsed.languages.append(language)
++-
++-        ensure_multi_language(parsed)
+++                parsed = parsed.model_copy()
+++                copied = True
+++                parsed.languages = list(parsed.languages) + [language]
+++
+++        languages = parsed.languages
+++        if (len(languages) > 1 or parsed.dubbed) and not (
+++            languages and languages[0] == "multi"
+++        ):
+++            if not copied:
+++                parsed = parsed.model_copy()
+++            ensure_multi_language(parsed)
++ 
++         if remove_adult_content and parsed.adult:
++             _log_exclusion(f"🔞 Rejected (Adult) | {torrent_title}")
++diff --git a/comet/services/lock.py b/comet/services/lock.py
++index 0f842f9..27b9ee5 100644
++--- a/comet/services/lock.py
+++++ b/comet/services/lock.py
++@@ -5,6 +5,11 @@ import uuid
++ from comet.core.database import database, fetch_flag
++ from comet.core.logger import logger
++ from comet.core.models import settings
+++from comet.services.redis_cache import (is_redis_available,
+++                                        redis_lock_acquire,
+++                                        redis_lock_exists,
+++                                        redis_lock_refresh,
+++                                        redis_lock_release)
++ 
++ _ACQUIRE_OR_REFRESH_LOCK_QUERY = """
++     INSERT INTO scrape_locks (lock_key, instance_id, updated_at, expires_at)
++@@ -34,8 +39,38 @@ class DistributedLock:
++         self.retry_interval = retry_interval
++         self.instance_id = str(uuid.uuid4())
++         self.acquired = False
+++        self._use_redis = is_redis_available()
++ 
++     async def acquire(self, wait_timeout: int = None):
+++        if self._use_redis:
+++            return await self._acquire_redis(wait_timeout)
+++        return await self._acquire_db(wait_timeout)
+++
+++    async def _acquire_redis(self, wait_timeout: int = None):
+++        start_time = time.time()
+++        while True:
+++            if self.acquired:
+++                refreshed = await redis_lock_refresh(self.lock_key, self.instance_id, self.timeout)
+++                if refreshed:
+++                    return True
+++                self.acquired = False
+++
+++            instance_id = await redis_lock_acquire(self.lock_key, self.timeout)
+++            if instance_id:
+++                self.instance_id = instance_id
+++                self.acquired = True
+++                return True
+++
+++            if wait_timeout is None:
+++                return False
+++
+++            if wait_timeout > 0 and (time.time() - start_time) >= wait_timeout:
+++                logger.log("LOCK", f"⏰ Lock acquisition timeout for {self.lock_key}")
+++                return False
+++
+++            await asyncio.sleep(self.retry_interval)
+++
+++    async def _acquire_db(self, wait_timeout: int = None):
++         start_time = time.time()
++ 
++         while True:
++@@ -81,6 +116,11 @@ class DistributedLock:
++         if not self.acquired:
++             return
++ 
+++        if self._use_redis:
+++            await redis_lock_release(self.lock_key, self.instance_id)
+++            self.acquired = False
+++            return
+++
++         try:
++             await database.execute(
++                 "DELETE FROM scrape_locks WHERE lock_key = :lock_key AND instance_id = :instance_id",
++@@ -98,3 +138,20 @@ class DistributedLock:
++ 
++     async def __aexit__(self, exc_type, exc_val, exc_tb):
++         await self.release()
+++
+++
+++async def is_scrape_in_progress(media_id: str):
+++    if is_redis_available():
+++        return await redis_lock_exists(media_id)
+++
+++    try:
+++        current_time = time.time()
+++        row = await database.fetch_one(
+++            "SELECT instance_id FROM scrape_locks WHERE lock_key = :lock_key AND expires_at >= :current_time",
+++            {"lock_key": media_id, "current_time": current_time},
+++            force_primary=True,
+++        )
+++        return row is not None
+++    except Exception as e:
+++        logger.log("LOCK", f"❌ Error checking scrape status for {media_id}: {e}")
+++        return False
++diff --git a/comet/services/orchestration.py b/comet/services/orchestration.py
++index cab90ad..c3d4af6 100644
++--- a/comet/services/orchestration.py
+++++ b/comet/services/orchestration.py
++@@ -12,7 +12,8 @@ from comet.services.filtering import filter_worker
++ from comet.services.ranking import rank_worker
++ from comet.services.torrent_manager import torrent_update_queue
++ from comet.utils.media_ids import normalize_cache_media_ids
++-from comet.utils.parsing import ensure_multi_language, parsed_matches_target
+++from comet.utils.parsing import ensure_multi_language, needs_multi_language, parsed_matches_target
+++from comet.services.redis_cache import redis_mark_fresh_torrents
++ from comet.utils.torrent_cache import (build_torrent_cache_where,
++                                        normalize_search_params)
++ 
++@@ -167,8 +168,9 @@ class TorrentManager:
++             rows = list(best_rows.values())
++ 
++         for row in rows:
++-            parsed_data = ParsedData(**orjson.loads(row["parsed_json"]))
++-            ensure_multi_language(parsed_data)
+++            parsed_data = ParsedData.model_construct(**orjson.loads(row["parsed_json"]))
+++            if needs_multi_language(parsed_data):
+++                ensure_multi_language(parsed_data)
++ 
++             target_season = self.search_season
++             if (
++@@ -239,6 +241,11 @@ class TorrentManager:
++             )
++ 
++     async def cache_torrents(self):
+++        if self.ready_to_cache:
+++            await redis_mark_fresh_torrents(
+++                self.media_only_id, self.search_season, self.search_episode
+++            )
+++
++         file_infos = []
++         for torrent in self.ready_to_cache:
++             self._append_cache_file_infos(file_infos, torrent)
++@@ -270,7 +277,7 @@ class TorrentManager:
++             return
++ 
++         loop = asyncio.get_running_loop()
++-        chunk_size = 20
+++        chunk_size = 200
++         tasks = [
++             loop.run_in_executor(
++                 get_executor(),
++diff --git a/comet/services/redis_cache.py b/comet/services/redis_cache.py
++new file mode 100644
++index 0000000..1ebe8ae
++--- /dev/null
+++++ b/comet/services/redis_cache.py
++@@ -0,0 +1,409 @@
+++import hashlib
+++import uuid
+++
+++import orjson
+++
+++from comet.core.logger import logger
+++from comet.core.models import settings
+++
+++_redis = None
+++TORRENT_CACHE_PREFIX = "comet:tc:"
+++RANKED_CACHE_PREFIX = "comet:rc:"
+++LOCK_PREFIX = "comet:lock:"
+++DEBRID_CACHE_PREFIX = "comet:dc:"
+++FIRST_SEARCH_PREFIX = "comet:fs:"
+++FRESH_TORRENT_PREFIX = "comet:ft:"
+++METADATA_CACHE_PREFIX = "comet:mc:"
+++DEFAULT_TTL = 300
+++
+++
+++async def setup_redis():
+++    global _redis
+++    url = getattr(settings, "REDIS_URL", None)
+++    if not url:
+++        return
+++    try:
+++        import redis.asyncio as aioredis
+++
+++        _redis = aioredis.from_url(url, decode_responses=False)
+++        await _redis.ping()
+++        logger.log("COMET", f"Redis cache connected: {url}")
+++    except Exception as e:
+++        logger.warning(f"Redis cache unavailable, falling back to DB only: {e}")
+++        _redis = None
+++
+++
+++async def shutdown_redis():
+++    global _redis
+++    if _redis:
+++        await _redis.aclose()
+++        _redis = None
+++
+++
+++_settings_hash_cache = {}
+++
+++
+++def _settings_hash(rtn_settings, rtn_ranking, max_size, remove_trash, max_results_per_resolution=0):
+++    # model_dump() is expensive; cache the base hash per (id(settings), id(ranking))
+++    # and only mix in the cheap scalar params per call.
+++    s_id = id(rtn_settings)
+++    r_id = id(rtn_ranking)
+++    base_key = (s_id, r_id)
+++
+++    base_bytes = _settings_hash_cache.get(base_key)
+++    if base_bytes is None:
+++        base_bytes = orjson.dumps(
+++            {
+++                "s": rtn_settings.model_dump() if hasattr(rtn_settings, "model_dump") else str(rtn_settings),
+++                "r": rtn_ranking.model_dump() if hasattr(rtn_ranking, "model_dump") else str(rtn_ranking),
+++            },
+++            option=orjson.OPT_SORT_KEYS,
+++        )
+++        _settings_hash_cache[base_key] = base_bytes
+++        # Evict old entries to avoid unbounded growth
+++        if len(_settings_hash_cache) > 256:
+++            _settings_hash_cache.clear()
+++            _settings_hash_cache[base_key] = base_bytes
+++
+++    raw = base_bytes + orjson.dumps(
+++        {"ms": max_size, "mr": max_results_per_resolution, "rt": remove_trash},
+++        option=orjson.OPT_SORT_KEYS,
+++    )
+++    return hashlib.md5(raw, usedforsecurity=False).hexdigest()[:12]
+++
+++
+++def _torrent_key(media_id: str, season, episode):
+++    return f"{TORRENT_CACHE_PREFIX}{media_id}:{season}:{episode}"
+++
+++
+++def _ranked_key(media_id: str, season, episode, settings_hash: str):
+++    return f"{RANKED_CACHE_PREFIX}{media_id}:{season}:{episode}:{settings_hash}"
+++
+++
+++def _serialize_torrent_dict(torrents: dict) -> bytes:
+++    serializable = {}
+++    for info_hash, t in torrents.items():
+++        entry = {
+++            "fileIndex": t.get("fileIndex"),
+++            "title": t["title"],
+++            "seeders": t.get("seeders"),
+++            "size": t.get("size"),
+++            "tracker": t.get("tracker"),
+++            "sources": t.get("sources"),
+++        }
+++        parsed = t.get("parsed")
+++        if parsed is not None:
+++            entry["parsed"] = parsed.model_dump() if hasattr(parsed, "model_dump") else parsed
+++        serializable[info_hash] = entry
+++    return orjson.dumps(serializable)
+++
+++
+++def _deserialize_torrent_dict(data: bytes) -> dict:
+++    from RTN import ParsedData
+++
+++    raw = orjson.loads(data)
+++    torrents = {}
+++    for info_hash, entry in raw.items():
+++        parsed_dict = entry.pop("parsed", None)
+++        if parsed_dict is not None:
+++            entry["parsed"] = ParsedData.model_construct(**parsed_dict)
+++        else:
+++            entry["parsed"] = None
+++        torrents[info_hash] = entry
+++    return torrents
+++
+++
+++def _serialize_ranked(ranked_torrents: dict, torrents: dict) -> bytes:
+++    data = {
+++        "ranked": list(ranked_torrents.keys()),
+++        "torrents": {},
+++    }
+++    for info_hash in ranked_torrents:
+++        t = torrents.get(info_hash, {})
+++        entry = {
+++            "fileIndex": t.get("fileIndex"),
+++            "title": t.get("title", ""),
+++            "seeders": t.get("seeders"),
+++            "size": t.get("size"),
+++            "tracker": t.get("tracker"),
+++            "sources": t.get("sources"),
+++        }
+++        parsed = t.get("parsed")
+++        if parsed is not None:
+++            entry["parsed"] = parsed.model_dump() if hasattr(parsed, "model_dump") else parsed
+++        data["torrents"][info_hash] = entry
+++    return orjson.dumps(data)
+++
+++
+++def _deserialize_ranked(data: bytes):
+++    from RTN import ParsedData
+++
+++    raw = orjson.loads(data)
+++    ranked_hashes = raw["ranked"]
+++    torrents = {}
+++    for info_hash, entry in raw["torrents"].items():
+++        parsed_dict = entry.pop("parsed", None)
+++        if parsed_dict is not None:
+++            entry["parsed"] = ParsedData.model_construct(**parsed_dict)
+++        else:
+++            entry["parsed"] = None
+++        torrents[info_hash] = entry
+++    return ranked_hashes, torrents
+++
+++
+++async def get_cached_torrents(media_id: str, season, episode):
+++    if not _redis:
+++        return None
+++    try:
+++        data = await _redis.get(_torrent_key(media_id, season, episode))
+++        if data:
+++            return _deserialize_torrent_dict(data)
+++    except Exception:
+++        pass
+++    return None
+++
+++
+++async def set_cached_torrents(media_id: str, season, episode, torrents: dict, ttl: int = DEFAULT_TTL):
+++    if not _redis or not torrents:
+++        return
+++    try:
+++        key = _torrent_key(media_id, season, episode)
+++        await _redis.set(key, _serialize_torrent_dict(torrents), ex=ttl)
+++    except Exception:
+++        pass
+++
+++
+++async def get_cached_ranked(
+++    media_id, season, episode, rtn_settings, rtn_ranking, max_size, remove_trash,
+++    max_results_per_resolution=0,
+++):
+++    if not _redis:
+++        return None, None
+++    try:
+++        sh = _settings_hash(rtn_settings, rtn_ranking, max_size, remove_trash, max_results_per_resolution)
+++        data = await _redis.get(_ranked_key(media_id, season, episode, sh))
+++        if data:
+++            return _deserialize_ranked(data)
+++    except Exception:
+++        pass
+++    return None, None
+++
+++
+++async def set_cached_ranked(
+++    media_id, season, episode, rtn_settings, rtn_ranking, max_size, remove_trash,
+++    max_results_per_resolution, ranked_torrents, torrents, ttl: int = DEFAULT_TTL,
+++):
+++    if not _redis or not ranked_torrents:
+++        return
+++    try:
+++        sh = _settings_hash(rtn_settings, rtn_ranking, max_size, remove_trash, max_results_per_resolution)
+++        key = _ranked_key(media_id, season, episode, sh)
+++        await _redis.set(key, _serialize_ranked(ranked_torrents, torrents), ex=ttl)
+++    except Exception:
+++        pass
+++
+++
+++def is_redis_available():
+++    return _redis is not None
+++
+++
+++# --- Distributed Lock via Redis ---
+++
+++async def redis_lock_acquire(lock_key: str, timeout: int) -> str | None:
+++    if not _redis:
+++        return None
+++    instance_id = str(uuid.uuid4())
+++    try:
+++        key = f"{LOCK_PREFIX}{lock_key}"
+++        acquired = await _redis.set(key, instance_id, nx=True, ex=timeout)
+++        if acquired:
+++            return instance_id
+++    except Exception:
+++        pass
+++    return None
+++
+++
+++async def redis_lock_release(lock_key: str, instance_id: str):
+++    if not _redis:
+++        return
+++    try:
+++        key = f"{LOCK_PREFIX}{lock_key}"
+++        # Only release if we own the lock (atomic check-and-delete via Lua)
+++        script = """
+++        if redis.call("get", KEYS[1]) == ARGV[1] then
+++            return redis.call("del", KEYS[1])
+++        else
+++            return 0
+++        end
+++        """
+++        await _redis.eval(script, 1, key, instance_id)
+++    except Exception:
+++        pass
+++
+++
+++async def redis_lock_refresh(lock_key: str, instance_id: str, timeout: int) -> bool:
+++    if not _redis:
+++        return False
+++    try:
+++        key = f"{LOCK_PREFIX}{lock_key}"
+++        script = """
+++        if redis.call("get", KEYS[1]) == ARGV[1] then
+++            return redis.call("expire", KEYS[1], ARGV[2])
+++        else
+++            return 0
+++        end
+++        """
+++        result = await _redis.eval(script, 1, key, instance_id, str(timeout))
+++        return result == 1
+++    except Exception:
+++        return False
+++
+++
+++async def redis_lock_exists(lock_key: str) -> bool:
+++    if not _redis:
+++        return False
+++    try:
+++        key = f"{LOCK_PREFIX}{lock_key}"
+++        return bool(await _redis.exists(key))
+++    except Exception:
+++        return False
+++
+++
+++# --- First Search via Redis ---
+++
+++async def redis_first_search(media_id: str, ttl: int = 86400) -> bool | None:
+++    """Returns True if this is the first search (key was set), False if already searched, None if Redis unavailable."""
+++    if not _redis:
+++        return None
+++    try:
+++        key = f"{FIRST_SEARCH_PREFIX}{media_id}"
+++        result = await _redis.set(key, b"1", nx=True, ex=ttl)
+++        return bool(result)
+++    except Exception:
+++        return None
+++
+++
+++# --- Fresh Torrent Count via Redis ---
+++
+++def _fresh_torrent_key(media_id: str, season, episode):
+++    return f"{FRESH_TORRENT_PREFIX}{media_id}:{season}:{episode}"
+++
+++
+++async def redis_mark_fresh_torrents(media_id: str, season, episode, ttl: int = None):
+++    """Mark that fresh torrents exist for this media. TTL = LIVE_TORRENT_CACHE_TTL."""
+++    if not _redis:
+++        return
+++    if ttl is None:
+++        ttl = settings.LIVE_TORRENT_CACHE_TTL
+++    if ttl < 0:
+++        ttl = 86400 * 365  # effectively never expires
+++    try:
+++        key = _fresh_torrent_key(media_id, season, episode)
+++        await _redis.set(key, b"1", ex=ttl)
+++    except Exception:
+++        pass
+++
+++
+++async def redis_has_fresh_torrents(media_id: str, season, episode) -> bool | None:
+++    """Check if fresh torrents exist. Returns True/False or None if Redis unavailable."""
+++    if not _redis:
+++        return None
+++    try:
+++        key = _fresh_torrent_key(media_id, season, episode)
+++        return bool(await _redis.exists(key))
+++    except Exception:
+++        return None
+++
+++
+++# --- Debrid Availability Cache via Redis ---
+++
+++def _debrid_cache_key(debrid_service: str, season, episode, info_hash: str):
+++    return f"{DEBRID_CACHE_PREFIX}{debrid_service}:{season}:{episode}:{info_hash}"
+++
+++
+++async def redis_get_debrid_availability(
+++    debrid_service: str, info_hashes: list, season=None, episode=None
+++) -> list | None:
+++    """Check Redis for cached debrid availability. Returns list of row-like dicts or None."""
+++    if not _redis:
+++        return None
+++    try:
+++        if not info_hashes:
+++            return []
+++        keys = [_debrid_cache_key(debrid_service, season, episode, ih) for ih in info_hashes]
+++        results = await _redis.mget(*keys)
+++        found = []
+++        for ih, data in zip(info_hashes, results):
+++            if data is not None:
+++                entry = orjson.loads(data)
+++                entry["info_hash"] = ih
+++                found.append(entry)
+++        if not found:
+++            return None
+++        return found
+++    except Exception:
+++        return None
+++
+++
+++async def redis_set_debrid_availability(
+++    debrid_service: str, rows: list, season=None, episode=None, ttl: int = None
+++):
+++    """Cache debrid availability rows as individual keys with TTL."""
+++    if not _redis or not rows:
+++        return
+++    if ttl is None:
+++        ttl = settings.DEBRID_CACHE_TTL
+++    try:
+++        pipe = _redis.pipeline()
+++        for row in rows:
+++            ih = row["info_hash"]
+++            key = _debrid_cache_key(debrid_service, season, episode, ih)
+++            entry = {
+++                "file_index": row.get("file_index"),
+++                "title": row.get("title"),
+++                "size": row.get("size"),
+++                "parsed": row.get("parsed"),
+++            }
+++            pipe.set(key, orjson.dumps(entry), ex=ttl)
+++        await pipe.execute()
+++    except Exception:
+++        pass
+++
+++
+++# --- Metadata Cache via Redis ---
+++
+++def _metadata_cache_key(media_id: str):
+++    return f"{METADATA_CACHE_PREFIX}{media_id}"
+++
+++
+++async def redis_get_metadata(media_id: str) -> dict | None:
+++    """Get cached metadata from Redis. Returns dict with title, year, year_end, aliases or None."""
+++    if not _redis:
+++        return None
+++    try:
+++        key = _metadata_cache_key(media_id)
+++        data = await _redis.get(key)
+++        if data:
+++            return orjson.loads(data)
+++    except Exception:
+++        pass
+++    return None
+++
+++
+++async def redis_set_metadata(media_id: str, metadata: dict, aliases: dict, ttl: int = None):
+++    """Cache metadata in Redis."""
+++    if not _redis:
+++        return
+++    if ttl is None:
+++        ttl = settings.METADATA_CACHE_TTL
+++    try:
+++        key = _metadata_cache_key(media_id)
+++        data = orjson.dumps({
+++            "title": metadata["title"],
+++            "year": metadata.get("year"),
+++            "year_end": metadata.get("year_end"),
+++            "aliases": aliases,
+++        })
+++        await _redis.set(key, data, ex=ttl)
+++    except Exception:
+++        pass
++diff --git a/comet/utils/parsing.py b/comet/utils/parsing.py
++index 5cced75..19d8dfd 100644
++--- a/comet/utils/parsing.py
+++++ b/comet/utils/parsing.py
++@@ -6,6 +6,14 @@ SCRAPE_URL_MODE_BOTH = "both"
++ SCRAPE_URL_MODES = frozenset((SCRAPE_URL_MODE_BOTH, "live", "background"))
++ 
++ 
+++def needs_multi_language(parsed: ParsedData) -> bool:
+++    """Check if ensure_multi_language would actually mutate this parsed object."""
+++    languages = parsed.languages
+++    return (len(languages) > 1 or parsed.dubbed) and not (
+++        languages and languages[0] == "multi"
+++    )
+++
+++
++ def ensure_multi_language(parsed: ParsedData):
++     languages = parsed.languages
++ 
++@@ -15,13 +23,9 @@ def ensure_multi_language(parsed: ParsedData):
++     if languages and languages[0] == "multi":
++         return
++ 
++-    try:
++-        languages.remove("multi")
++-    except ValueError:
++-        pass
++-
++-    languages.insert(0, "multi")
++-    parsed.languages = languages
+++    new_languages = [lang for lang in languages if lang != "multi"]
+++    new_languages.insert(0, "multi")
+++    parsed.languages = new_languages
++ 
++ 
++ def is_video(title: str):
++diff --git a/pyproject.toml b/pyproject.toml
++index 909122f..e25b522 100644
++--- a/pyproject.toml
+++++ b/pyproject.toml
++@@ -30,6 +30,7 @@ dependencies = [
++     "msgpack",
++     "miniupnpc",
++     "aiofiles",
+++    "redis",
++     "torrent-parse-rank",
++ ]
++ 
++-- 
++2.52.0
++
+diff --git a/pyproject.toml b/pyproject.toml
+index 909122f..e25b522 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -30,6 +30,7 @@ dependencies = [
+     "msgpack",
+     "miniupnpc",
+     "aiofiles",
++    "redis",
+     "torrent-parse-rank",
+ ]
+ 
+-- 
+2.52.0
+

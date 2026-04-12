@@ -29,10 +29,6 @@ class CometScraper(BaseScraper):
                     else None
                 )
 
-                tracker = None
-                if "🔎 " in title_full:
-                    tracker = title_full.split("🔎 ")[1].split("\n")[0]
-
                 torrents.append(
                     {
                         "title": title,
@@ -40,9 +36,7 @@ class CometScraper(BaseScraper):
                         "fileIndex": torrent.get("fileIdx", None),
                         "seeders": seeders,
                         "size": torrent["behaviorHints"].get("videoSize"),
-                        "tracker": f"Comet|{tracker}"
-                        if tracker is not None
-                        else "Comet",
+                        "tracker": "CometNet|ElfHosted",
                         "sources": torrent.get("sources", []),
                     }
                 )

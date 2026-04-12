@@ -8,6 +8,8 @@ from comet.core.database import (build_json_list_membership_predicate,
 from comet.core.logger import logger
 from comet.core.models import settings
 from comet.services.lock import DistributedLock
+from comet.services.redis_cache import (redis_first_search,
+                                        redis_has_fresh_torrents)
 from comet.utils.media_ids import normalize_cache_media_ids
 from comet.utils.torrent_cache import normalize_search_params
 
@@ -111,6 +113,16 @@ class CacheStateManager:
         Returns 1 if any fresh torrent exists, otherwise 0.
         If TTL is -1 (never expires), checks for any cached torrent.
         """
+        # Try Redis first for each cache_media_id
+        for cache_media_id in self.cache_media_ids:
+            result = await redis_has_fresh_torrents(
+                cache_media_id, self.search_season, self.search_episode
+            )
+            if result is True:
+                return 1
+            # result is None means Redis unavailable, fall through to DB
+
+        # Fall back to DB
         min_timestamp = None
         if settings.LIVE_TORRENT_CACHE_TTL >= 0:
             min_timestamp = time.time() - settings.LIVE_TORRENT_CACHE_TTL
@@ -163,6 +175,12 @@ class CacheStateManager:
         """
         Check if this is the first search for this media_id.
         """
+        # Try Redis first (single atomic SETNX)
+        redis_result = await redis_first_search(self.media_id)
+        if redis_result is not None:
+            return redis_result
+
+        # Fall back to DB
         current_time = time.time()
         insert_params = {
             "media_id": self.media_id,

@@ -2,7 +2,7 @@ import asyncio
 from urllib.parse import quote, unquote
 
 import aiohttp
-from RTN import normalize_title, parse, title_match
+from RTN import normalize_title, title_match
 
 from comet.core.execution import get_executor
 from comet.core.logger import logger
@@ -10,16 +10,20 @@ from comet.core.models import settings
 from comet.debrid.exceptions import DebridAuthError, DebridLinkGenerationError
 from comet.metadata.episode_index import EpisodeIndexService
 from comet.services.debrid_cache import cache_availability
-from comet.services.filtering import quick_alias_match
+from comet.services.filtering import _parse_with_cache, quick_alias_match
 from comet.services.torrent_manager import torrent_update_queue
-from comet.utils.parsing import (ensure_multi_language, is_video,
+from comet.utils.parsing import (ensure_multi_language, needs_multi_language, is_video,
                                  match_parsed_episode_target, parse_media_id)
 
 
 def batch_parse(filenames):
-    parsed_results = [parse(f) for f in filenames]
-    for parsed in parsed_results:
-        ensure_multi_language(parsed)
+    parsed_results = []
+    for f in filenames:
+        parsed = _parse_with_cache(f)
+        if needs_multi_language(parsed):
+            parsed = parsed.model_copy()
+            ensure_multi_language(parsed)
+        parsed_results.append(parsed)
     return parsed_results
 
 
