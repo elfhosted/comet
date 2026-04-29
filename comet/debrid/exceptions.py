@@ -13,8 +13,19 @@ class DebridError(Exception):
 class DebridAuthError(DebridError):
     """Raised when debrid authentication fails (not premium, invalid API key, etc.)."""
 
-    def __init__(self, debrid_name: str, message: str = None):
+    def __init__(
+        self,
+        debrid_name: str,
+        message: str = None,
+        *,
+        error_code: str | None = None,
+        upstream_error_code: str | None = None,
+        subscription_status: str | None = None,
+    ):
         self.debrid_name = debrid_name
+        self.error_code = error_code
+        self.upstream_error_code = upstream_error_code
+        self.subscription_status = subscription_status
         default_message = f"{debrid_name}: Authentication failed or not premium"
         display_message = (
             message

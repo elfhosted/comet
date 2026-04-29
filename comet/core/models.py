@@ -88,6 +88,8 @@ class AppSettings(BaseSettings):
     LIVE_TORRENT_CACHE_TTL: Optional[int] = 604800  # 7 days
     DEBRID_CACHE_TTL: Optional[int] = 86400  # 1 day
     METRICS_CACHE_TTL: Optional[int] = 60  # 1 minute
+    CREDENTIAL_VALIDATION_TTL_VALID: Optional[int] = 300  # 5 min
+    CREDENTIAL_VALIDATION_TTL_INVALID: Optional[int] = 30  # 30 sec
     DEBRID_CACHE_CHECK_RATIO: Optional[float] = 0.0  # 0.0 to 1.0
     SCRAPE_LOCK_TTL: Optional[int] = 300  # 5 minutes
     SCRAPE_WAIT_TIMEOUT: Optional[int] = (

@@ -256,6 +256,39 @@ def _dedupe_debrid_entries_by_service(debrid_entries: list) -> list:
     return list(unique_services.values())
 
 
+async def preflight_validate_credentials(
+    debrid_entries: list, ip: str, session
+) -> dict[str, DebridAuthError]:
+    """Validate all configured debrid credentials up front. Returns service -> error for failed entries."""
+    if not debrid_entries:
+        return {}
+
+    from comet.debrid.manager import get_debrid
+
+    unique_entries = _dedupe_debrid_entries_by_service(debrid_entries)
+
+    async def _validate(entry):
+        service = entry["service"]
+        api_key = entry["apiKey"]
+        try:
+            inst = get_debrid(session, "", "", service, api_key, ip)
+            if inst is None:
+                return service, None
+            await inst.check_premium()
+            return service, None
+        except DebridAuthError as e:
+            return service, e
+        except Exception as e:
+            logger.log(
+                "DEBRID",
+                f"⚠️ Credential preflight transient error on {service}: {e}",
+            )
+            return service, None
+
+    results = await asyncio.gather(*[_validate(e) for e in unique_entries])
+    return {service: err for service, err in results if err is not None}
+
+
 async def background_scrape(
     torrent_manager: TorrentManager,
     media_id: str,
@@ -487,6 +520,43 @@ async def stream(
         return _stream_response({"streams": [placeholder_stream]})
 
     session = await http_client_manager.get_session()
+    ip = get_client_ip(request)
+
+    preflight_auth_errors: dict[str, DebridAuthError] = {}
+    if debrid_entries:
+        preflight_auth_errors = await preflight_validate_credentials(
+            debrid_entries, ip, session
+        )
+        if preflight_auth_errors:
+            services_str = ", ".join(
+                f"{svc}({err.error_code or 'AUTH_ERROR'})"
+                for svc, err in preflight_auth_errors.items()
+            )
+            logger.log(
+                "DEBRID",
+                f"❌ Credential preflight failed: {services_str}",
+            )
+            unique_debrid_count = len(
+                _dedupe_debrid_entries_by_service(debrid_entries)
+            )
+            if (
+                len(preflight_auth_errors) >= unique_debrid_count
+                and not enable_torrent
+            ):
+                error_streams = [
+                    {
+                        "name": _stream_notice_name(
+                            kodi, f"[❌] {svc}", f"[ERROR] {svc}"
+                        ),
+                        "description": err.display_message,
+                        "url": "https://comet.feels.legal",
+                    }
+                    for svc, err in preflight_auth_errors.items()
+                ]
+                return _stream_response(
+                    {"streams": error_streams}, is_empty=True
+                )
+
     metadata_scraper = MetadataScraper(session)
 
     id, season, episode = parse_media_id(media_type, media_id)
@@ -545,7 +615,6 @@ async def stream(
     logger.log("SCRAPER", f"🔍 Starting search for {log_title}")
 
     media_only_id = id
-    ip = get_client_ip(request)
 
     is_kitsu = media_id.startswith("kitsu:")
     search_episode = episode
@@ -880,14 +949,17 @@ async def stream(
         )
         _merge_service_cache_status(service_cache_status, fresh_service_cache_status)
 
-        for service, error in debrid_errors.items():
-            cached_results.append(
-                {
-                    "name": (f"[ERROR] {service}" if kodi else f"[❌] {service}"),
-                    "description": error.display_message,
-                    "url": "https://comet.feels.legal",
-                }
-            )
+    for service, error in preflight_auth_errors.items():
+        debrid_errors.setdefault(service, error)
+
+    for service, error in debrid_errors.items():
+        cached_results.append(
+            {
+                "name": (f"[ERROR] {service}" if kodi else f"[❌] {service}"),
+                "description": error.display_message,
+                "url": "https://comet.feels.legal",
+            }
+        )
 
     debrid_stream_specs = [
         (entry_index, entry["service"], get_debrid_extension(entry["service"]))

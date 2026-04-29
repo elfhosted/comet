@@ -167,32 +167,139 @@ class StremThru:
             payload={"response": data, "status_code": response.status},
         )
 
+    def _format_auth_error(self, error: dict, status_code: int) -> DebridAuthError:
+        upstream = error.get("__upstream_cause__")
+        code = error.get("code") or ""
+        message = error.get("message") or ""
+        upstream_code = self._extract_upstream_error_code(upstream)
+        upstream_msg = ""
+        if isinstance(upstream, dict):
+            upstream_msg = upstream.get("detail") or upstream.get("message") or ""
+
+        detail = upstream_msg or message or "Authentication failed"
+
+        if code == "UNAUTHORIZED" or status_code == 401:
+            display = f"{self.store_name}: Invalid API key.\n{detail}"
+        elif code == "PAYMENT_REQUIRED" or status_code == 402:
+            display = f"{self.store_name}: Payment required (subscription expired).\n{detail}"
+        elif code == "FORBIDDEN" or status_code == 403:
+            display = f"{self.store_name}: Account access forbidden.\n{detail}"
+        elif code == "TOO_MANY_REQUESTS" or status_code == 429:
+            display = f"{self.store_name}: Rate limited by provider.\n{detail}"
+        elif code == "SERVICE_UNAVAILABLE" or status_code == 503:
+            display = f"{self.store_name}: Provider unavailable.\n{detail}"
+        else:
+            display = f"{self.store_name}: {detail}"
+
+        return DebridAuthError(
+            self.store_name,
+            display,
+            error_code=code or None,
+            upstream_error_code=upstream_code,
+        )
+
+    def _format_subscription_error(self, status: str | None) -> DebridAuthError:
+        if status == "expired":
+            display = (
+                f"{self.store_name}: Subscription expired.\n"
+                "Please renew your debrid account."
+            )
+        elif status:
+            display = (
+                f"{self.store_name}: No active premium subscription "
+                f"(status: {status}).\nPlease renew your debrid account."
+            )
+        else:
+            display = (
+                f"{self.store_name}: No active subscription.\n"
+                "Please renew your debrid account."
+            )
+        return DebridAuthError(
+            self.store_name,
+            display,
+            error_code="PAYMENT_REQUIRED",
+            subscription_status=status,
+        )
+
     async def check_premium(self):
+        from comet.services.redis_cache import (get_credential_validation,
+                                                set_credential_validation)
+
+        cached = await get_credential_validation(
+            self.store_name, self.store_token
+        )
+        if cached is not None:
+            if cached.get("valid"):
+                return
+            raise DebridAuthError(
+                self.store_name,
+                cached.get("display_message"),
+                error_code=cached.get("error_code"),
+                upstream_error_code=cached.get("upstream_error_code"),
+                subscription_status=cached.get("subscription_status"),
+            )
+
+        auth_err: DebridAuthError | None = None
+        subscription_status: str | None = None
         try:
             response = await self.session.get(
                 f"{self.base_url}/user?client_ip={self.client_ip}",
                 headers=self._headers(),
             )
-            user = await response.json()
-
-            if "data" not in user:
+            try:
+                user = await response.json(content_type=None)
+            except Exception as exc:
                 raise DebridAuthError(
+                    self.store_name,
+                    f"{self.store_name}: Failed to check account status (invalid response from provider).",
+                ) from exc
+
+            error = user.get("error") if isinstance(user, dict) else None
+            if isinstance(error, dict):
+                auth_err = self._format_auth_error(error, response.status)
+                raise auth_err
+
+            data = user.get("data") if isinstance(user, dict) else None
+            if not isinstance(data, dict):
+                auth_err = DebridAuthError(
                     self.store_name,
                     f"{self.store_name}: Invalid API key.\nPlease check your configuration.",
+                    error_code="UNAUTHORIZED",
                 )
+                raise auth_err
 
-            if user["data"]["subscription_status"] != "premium":
-                raise DebridAuthError(
-                    self.store_name,
-                    f"{self.store_name}: No active subscription.\nPlease renew your debrid account.",
-                )
+            subscription_status = data.get("subscription_status")
+            if subscription_status != "premium":
+                auth_err = self._format_subscription_error(subscription_status)
+                raise auth_err
         except DebridAuthError:
+            if auth_err is not None:
+                await set_credential_validation(
+                    self.store_name,
+                    self.store_token,
+                    {
+                        "valid": False,
+                        "display_message": auth_err.display_message,
+                        "error_code": auth_err.error_code,
+                        "upstream_error_code": auth_err.upstream_error_code,
+                        "subscription_status": auth_err.subscription_status,
+                    },
+                    ttl=settings.CREDENTIAL_VALIDATION_TTL_INVALID,
+                )
             raise
         except Exception as e:
+            # Transient (network, etc.) — don't cache.
             raise DebridAuthError(
                 self.store_name,
                 f"{self.store_name}: Failed to check account status.\n{e}",
             )
+
+        await set_credential_validation(
+            self.store_name,
+            self.store_token,
+            {"valid": True, "subscription_status": subscription_status},
+            ttl=settings.CREDENTIAL_VALIDATION_TTL_VALID,
+        )
 
     async def get_instant(self, magnets: list):
         try:

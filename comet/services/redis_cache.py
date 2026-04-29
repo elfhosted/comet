@@ -1,4 +1,5 @@
 import hashlib
+import time
 import uuid
 
 import orjson
@@ -14,6 +15,7 @@ DEBRID_CACHE_PREFIX = "comet:dc:"
 FIRST_SEARCH_PREFIX = "comet:fs:"
 FRESH_TORRENT_PREFIX = "comet:ft:"
 METADATA_CACHE_PREFIX = "comet:mc:"
+CREDENTIAL_VALIDATION_PREFIX = "comet:cv:"
 DEFAULT_TTL = 300
 
 
@@ -405,5 +407,70 @@ async def redis_set_metadata(media_id: str, metadata: dict, aliases: dict, ttl: 
             "aliases": aliases,
         })
         await _redis.set(key, data, ex=ttl)
+    except Exception:
+        pass
+
+
+# --- Credential Validation Cache (Redis + in-process TTL fallback) ---
+
+_INPROC_CRED_MAX = 10_000
+_inproc_cred_cache: dict[tuple[str, str], tuple[float, dict]] = {}
+
+
+def _credential_validation_key(service: str, api_key: str) -> str:
+    api_key_hash = hashlib.sha256(
+        (api_key or "").encode("utf-8"), usedforsecurity=False
+    ).hexdigest()[:16]
+    return f"{CREDENTIAL_VALIDATION_PREFIX}{service}:{api_key_hash}"
+
+
+def _inproc_cred_get(service: str, api_key: str) -> dict | None:
+    entry = _inproc_cred_cache.get((service, api_key))
+    if entry is None:
+        return None
+    expires_at, payload = entry
+    if expires_at <= time.monotonic():
+        _inproc_cred_cache.pop((service, api_key), None)
+        return None
+    return payload
+
+
+def _inproc_cred_set(service: str, api_key: str, payload: dict, ttl: int):
+    if len(_inproc_cred_cache) >= _INPROC_CRED_MAX:
+        now = time.monotonic()
+        # Sweep expired; if still full, drop oldest by expiry.
+        for k, (exp, _) in list(_inproc_cred_cache.items()):
+            if exp <= now:
+                _inproc_cred_cache.pop(k, None)
+        if len(_inproc_cred_cache) >= _INPROC_CRED_MAX:
+            oldest_key = min(_inproc_cred_cache, key=lambda k: _inproc_cred_cache[k][0])
+            _inproc_cred_cache.pop(oldest_key, None)
+    _inproc_cred_cache[(service, api_key)] = (time.monotonic() + ttl, payload)
+
+
+async def get_credential_validation(service: str, api_key: str) -> dict | None:
+    """Cached debrid credential validation. Dict has 'valid' bool plus error fields when invalid.
+
+    Prefers Redis when available; falls back to an in-process TTL cache on standalone instances.
+    """
+    if _redis:
+        try:
+            data = await _redis.get(_credential_validation_key(service, api_key))
+            if data:
+                return orjson.loads(data)
+        except Exception:
+            pass
+    return _inproc_cred_get(service, api_key)
+
+
+async def set_credential_validation(
+    service: str, api_key: str, result: dict, ttl: int
+):
+    _inproc_cred_set(service, api_key, result, ttl)
+    if not _redis:
+        return
+    try:
+        key = _credential_validation_key(service, api_key)
+        await _redis.set(key, orjson.dumps(result), ex=ttl)
     except Exception:
         pass
