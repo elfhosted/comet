@@ -38,6 +38,7 @@ class TorrentManager:
         cache_media_ids: list[str] | None = None,
         target_air_date: str | None = None,
         reject_unknown_episode_files: bool = False,
+        forward_config: dict | None = None,
     ):
         self.media_type = media_type
         self.media_id = media_full_id
@@ -60,6 +61,7 @@ class TorrentManager:
         )
         self.target_air_date = target_air_date
         self.reject_unknown_episode_files = reject_unknown_episode_files
+        self.forward_config = forward_config
 
         self.seen_hashes = set()
         self.torrents = {}
@@ -99,6 +101,7 @@ class TorrentManager:
             season=self.search_season,
             episode=self.search_episode,
             context=self.context,
+            forward_config=self.forward_config,
         )
 
         async for scraper_name, results in scraper_manager.scrape_all(request):

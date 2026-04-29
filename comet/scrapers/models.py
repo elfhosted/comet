@@ -1,4 +1,4 @@
-from typing import List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 from pydantic import BaseModel
 
@@ -13,6 +13,9 @@ class ScrapeRequest(BaseModel):
     season: Optional[int] = None
     episode: Optional[int] = None
     context: str = "live"  # "live" or "background"
+    # Sanitized, credential-free config forwarded to upstream scrapers that
+    # accept a b64config (currently only CometScraper). None means no forward.
+    forward_config: Optional[Dict[str, Any]] = None
 
 
 class ScrapeResult(TypedDict):

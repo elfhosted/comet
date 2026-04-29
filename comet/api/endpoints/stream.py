@@ -18,6 +18,7 @@ from comet.services.debrid import DebridService
 from comet.services.debrid_account_scraper import (
     ensure_account_snapshot_ready, get_account_torrents_for_media,
     ingest_account_torrents_to_public_cache, schedule_account_snapshot_refresh)
+from comet.scrapers.comet import build_upstream_forward_config
 from comet.services.lock import DistributedLock
 from comet.services.orchestration import TorrentManager
 from comet.services.trackers import trackers
@@ -620,6 +621,7 @@ async def stream(
             )
 
     remove_adult_content = settings.REMOVE_ADULT_CONTENT and config["removeTrash"]
+    forward_config = build_upstream_forward_config(config)
     torrent_manager = TorrentManager(
         media_type,
         media_id,
@@ -637,6 +639,7 @@ async def stream(
         cache_media_ids=cache_media_ids,
         target_air_date=target_air_date,
         reject_unknown_episode_files=reject_unknown_episode_files,
+        forward_config=forward_config,
     )
 
     redis_torrents = await redis_get_torrents(media_only_id, search_season, search_episode)

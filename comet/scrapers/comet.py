@@ -1,6 +1,38 @@
+import base64
+
+import orjson
+
 from comet.core.logger import log_scraper_error
+from comet.core.models import settings
 from comet.scrapers.base import BaseScraper
 from comet.scrapers.models import ScrapeRequest
+
+
+def build_upstream_forward_config(config: dict) -> dict | None:
+    """Build a sanitized, credential-free config for forwarding to an upstream
+    Comet instance. Returns None if forwarding is disabled. The result tells
+    the upstream to run in torrent/p2p mode (no debrid) but to apply this
+    user's RTN filters before returning, so we receive a pre-filtered set."""
+    if not settings.COMET_SCRAPER_FORWARD_CONFIG:
+        return None
+    return {
+        "cachedOnly": False,
+        "sortCachedUncachedTogether": False,
+        "removeTrash": config["removeTrash"],
+        "resultFormat": ["all"],
+        "maxResultsPerResolution": config["maxResultsPerResolution"],
+        "maxSize": config["maxSize"],
+        "debridService": "torrent",
+        "debridApiKey": "",
+        "debridServices": [],
+        "enableTorrent": True,
+        "deduplicateStreams": False,
+        "scrapeDebridAccountTorrents": False,
+        "debridStreamProxyPassword": "",
+        "languages": config["languages"],
+        "resolutions": config["resolutions"],
+        "options": config["options"],
+    }
 
 
 class CometScraper(BaseScraper):
@@ -10,9 +42,17 @@ class CometScraper(BaseScraper):
     async def scrape(self, request: ScrapeRequest):
         torrents = []
         try:
-            async with self.session.get(
-                f"{self.url}/stream/{request.media_type}/{request.media_id}.json",
-            ) as response:
+            b64 = None
+            if request.forward_config is not None:
+                b64 = base64.b64encode(
+                    orjson.dumps(request.forward_config)
+                ).decode()
+            path = (
+                f"{self.url}/{b64}/stream/{request.media_type}/{request.media_id}.json"
+                if b64
+                else f"{self.url}/stream/{request.media_type}/{request.media_id}.json"
+            )
+            async with self.session.get(path) as response:
                 results = await response.json()
 
             for torrent in results["streams"]:
