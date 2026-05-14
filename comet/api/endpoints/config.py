@@ -156,6 +156,7 @@ async def configure(
             "proxyDebridStream": settings.PROXY_DEBRID_STREAM,
             "disableTorrentStreams": settings.DISABLE_TORRENT_STREAMS,
             "stremioApiPrefix": settings.STREMIO_API_PREFIX,
+            "enableDebridge": settings.ENABLE_DEBRIDGE,
         },
     )
 

@@ -638,7 +638,13 @@
             apiKeyUrl: "https://mypikpak.com",
             referralUrl: null,
             helpText: "Format: `email:password`"
-          }
+          }{% if enableDebridge %},
+          debridge: {
+            name: "Debridge",
+            apiKeyUrl: "https://store.elfhosted.com/my-account/debridge/",
+            referralUrl: null,
+            helpText: "Format: `api-key`"
+          }{% endif %}
         };
 
         const torrentDisabled = {{ 'true' if disableTorrentStreams else 'false' }};

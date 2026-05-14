@@ -15,6 +15,7 @@ debrid_services = {
     "easydebrid": {"extension": "ED"},
     "offcloud": {"extension": "OC"},
     "pikpak": {"extension": "PP"},
+    "debridge": {"extension": "DG"},
     "torrent": {"extension": "TORRENT"},
 }
 

@@ -119,6 +119,7 @@ class AppSettings(BaseSettings):
     COMET_URL: Union[str, List[str]] = "https://comet.feels.legal"
     COMET_CLEAN_TRACKER: Optional[bool] = False
     COMET_SCRAPER_FORWARD_CONFIG: Optional[bool] = False
+    ENABLE_DEBRIDGE: Optional[bool] = False
     SCRAPE_NYAA: Union[bool, str] = False
     NYAA_ANIME_ONLY: Optional[bool] = True
     NYAA_MAX_CONCURRENT_PAGES: Optional[int] = 5
@@ -1007,6 +1008,9 @@ VALID_DEBRID_SERVICES = [
     "offcloud",
     "pikpak",
 ]
+
+if settings.ENABLE_DEBRIDGE:
+    VALID_DEBRID_SERVICES.append("debridge")
 
 
 class DebridServiceEntry(BaseModel):
