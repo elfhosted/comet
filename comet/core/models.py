@@ -120,6 +120,7 @@ class AppSettings(BaseSettings):
     COMET_CLEAN_TRACKER: Optional[bool] = False
     COMET_SCRAPER_FORWARD_CONFIG: Optional[bool] = False
     ENABLE_DEBRIDGE: Optional[bool] = False
+    NODE_NAME: Optional[str] = None
     SCRAPE_NYAA: Union[bool, str] = False
     NYAA_ANIME_ONLY: Optional[bool] = True
     NYAA_MAX_CONCURRENT_PAGES: Optional[int] = 5

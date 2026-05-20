@@ -60,11 +60,14 @@ class StremThru:
         return token, ""
 
     def _headers(self):
-        return {
+        headers = {
             "X-StremThru-Store-Name": self.store_name,
             "X-StremThru-Store-Authorization": f"Bearer {self.store_token}",
             "User-Agent": "comet",
         }
+        if settings.NODE_NAME:
+            headers["X-Debridge-Node"] = settings.NODE_NAME
+        return headers
 
     @staticmethod
     def _extract_upstream_error_code(upstream_error: dict | None) -> str | None:
