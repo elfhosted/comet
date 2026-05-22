@@ -63,6 +63,7 @@ class StremThru:
         headers = {
             "X-StremThru-Store-Name": self.store_name,
             "X-StremThru-Store-Authorization": f"Bearer {self.store_token}",
+            "X-StremThru-Client-Capabilities": "must_proxy",
             "User-Agent": "comet",
         }
         if settings.NODE_NAME:
@@ -540,7 +541,7 @@ class StremThru:
                 logger.warning(
                     f"Unrecognized magnet status '{magnet_status}' for {hash} on {self.store_name}"
                 )
-                return
+                return None, False
 
             name = unquote(name)
             torrent_name = unquote(torrent_name)
@@ -569,7 +570,7 @@ class StremThru:
 
             if not video_files:
                 logger.warning(f"No video files found in torrent {hash}")
-                return
+                return None, False
 
             loop = asyncio.get_running_loop()
             parsed_results = await loop.run_in_executor(
@@ -688,7 +689,7 @@ class StremThru:
                     "PLAYBACK",
                     f"No valid video files with links found in torrent {hash}",
                 )
-                return
+                return None, False
 
             # Sort by score descending
             scored_files.sort(key=lambda x: x["score"], reverse=True)
@@ -747,7 +748,8 @@ class StremThru:
                 "generate download link",
             )
 
-            link_url = link.get("data", {}).get("link")
+            link_data = link.get("data", {})
+            link_url = link_data.get("link")
             if not link_url:
                 logger.warning(
                     f"Missing generated link for hash {hash} and target_file={target_file}. Full response payload: {link}"
@@ -762,10 +764,11 @@ class StremThru:
                     },
                 )
 
-            return link_url
+            return link_url, bool(link_data.get("must_proxy", False))
         except DebridLinkGenerationError:
             raise
         except Exception as e:
             logger.exception(
                 f"Exception while getting download link for {hash} ({type(e).__name__}): {e!r}"
             )
+            return None, False

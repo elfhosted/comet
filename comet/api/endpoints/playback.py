@@ -232,7 +232,7 @@ async def playback(
             ip if not should_proxy else "",
         )
         try:
-            download_url = await debrid.generate_download_link(
+            download_url, must_proxy = await debrid.generate_download_link(
                 hash,
                 index,
                 name,
@@ -255,14 +255,23 @@ async def playback(
                 default_key="UNKNOWN",
             )
 
-        await cache_download_link(
-            debrid_service=debrid_service,
-            account_key_hash=account_key_hash,
-            info_hash=hash,
-            season=season,
-            episode=episode,
-            download_url=download_url,
-        )
+        if must_proxy:
+            if not settings.PROXY_DEBRID_STREAM:
+                return build_status_video_response(
+                    [],
+                    default_key="UNKNOWN",
+                )
+            should_proxy = True
+
+        if not must_proxy:
+            await cache_download_link(
+                debrid_service=debrid_service,
+                account_key_hash=account_key_hash,
+                info_hash=hash,
+                season=season,
+                episode=episode,
+                download_url=download_url,
+            )
 
     if should_proxy:
         return await custom_handle_stream_request(
