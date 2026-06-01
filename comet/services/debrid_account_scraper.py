@@ -1,6 +1,9 @@
 import asyncio
+import hashlib
 import time
 from datetime import datetime
+
+import orjson
 
 from comet.core.database import (_debrid_account_snapshot_ttl,
                                  build_json_list_membership_predicate,
@@ -12,6 +15,8 @@ from comet.debrid.manager import build_account_key_hash
 from comet.debrid.stremthru import StremThru
 from comet.services.filtering import filter_worker
 from comet.services.lock import DistributedLock
+from comet.services.redis_cache import (redis_get_account_snapshot_fp,
+                                        redis_set_account_snapshot_fp)
 from comet.services.torrent_manager import torrent_update_queue
 from comet.utils.parsing import parsed_matches_target
 
@@ -21,36 +26,48 @@ _background_tasks: set[asyncio.Task] = set()
 TORRENT_INFO_HASH_MEMBERSHIP_SQL = build_json_list_membership_predicate(
     "info_hash", "info_hashes"
 )
-_UPSERT_ACCOUNT_MAGNET_QUERY = """
-    INSERT INTO debrid_account_magnets (
-        debrid_service,
-        account_key_hash,
-        magnet_id,
-        info_hash,
-        name,
-        size,
-        status,
-        added_at,
-        synced_at
-    ) VALUES (
-        :debrid_service,
-        :account_key_hash,
-        :magnet_id,
-        :info_hash,
-        :name,
-        :size,
-        :status,
-        :added_at,
-        :synced_at
-    )
-    ON CONFLICT (debrid_service, account_key_hash, magnet_id)
-    DO UPDATE SET
-        info_hash = EXCLUDED.info_hash,
-        name = EXCLUDED.name,
-        size = EXCLUDED.size,
-        status = EXCLUDED.status,
-        added_at = EXCLUDED.added_at,
-        synced_at = EXCLUDED.synced_at
+# Columns written per magnet, in a fixed order, so a snapshot can be flattened into
+# a single multi-row INSERT instead of one statement per magnet.
+_MAGNET_INSERT_COLUMNS = (
+    "debrid_service",
+    "account_key_hash",
+    "magnet_id",
+    "info_hash",
+    "name",
+    "size",
+    "status",
+    "added_at",
+    "synced_at",
+)
+# Columns whose change should trigger a real upsert (everything except the conflict
+# key). synced_at is included so the read-side freshness watermark is refreshed.
+_MAGNET_UPDATE_COLUMNS = (
+    "info_hash",
+    "name",
+    "size",
+    "status",
+    "added_at",
+    "synced_at",
+)
+# Fields that define whether the account's magnet set actually changed (the snapshot
+# fingerprint). Excludes synced_at, which is just the freshness watermark.
+_MAGNET_FINGERPRINT_COLUMNS = (
+    "magnet_id",
+    "info_hash",
+    "name",
+    "size",
+    "status",
+    "added_at",
+)
+_MAGNET_INSERT_CHUNK = 100
+_MAGNET_SQL_CACHE: dict[int, str] = {}
+
+_TOUCH_SNAPSHOT_QUERY = """
+    UPDATE debrid_account_magnets
+    SET synced_at = :synced_at
+    WHERE debrid_service = :debrid_service
+      AND account_key_hash = :account_key_hash
+    RETURNING 1
 """
 _UPSERT_ACCOUNT_SYNC_STATE_QUERY = """
     INSERT INTO debrid_account_sync_state (
@@ -154,11 +171,77 @@ async def _fetch_all_magnets(client: StremThru, max_items: int):
     return list(items_by_id.values())
 
 
+def _multi_row_magnet_sql(n: int) -> str:
+    sql = _MAGNET_SQL_CACHE.get(n)
+    if sql is None:
+        rows_sql = ",\n        ".join(
+            "(" + ", ".join(f":{col}_{i}" for col in _MAGNET_INSERT_COLUMNS) + ")"
+            for i in range(n)
+        )
+        set_sql = ",\n            ".join(
+            f"{col} = EXCLUDED.{col}" for col in _MAGNET_UPDATE_COLUMNS
+        )
+        sql = f"""
+    INSERT INTO debrid_account_magnets (
+        {", ".join(_MAGNET_INSERT_COLUMNS)}
+    ) VALUES
+        {rows_sql}
+    ON CONFLICT (debrid_service, account_key_hash, magnet_id)
+    DO UPDATE SET
+            {set_sql}
+"""
+        if len(_MAGNET_SQL_CACHE) > 64:
+            _MAGNET_SQL_CACHE.clear()
+        _MAGNET_SQL_CACHE[n] = sql
+    return sql
+
+
+def _snapshot_fingerprint(rows: list[dict]) -> str:
+    """Stable fingerprint of an account's magnet set (content, not synced_at)."""
+    items = sorted(
+        tuple(row[col] for col in _MAGNET_FINGERPRINT_COLUMNS) for row in rows
+    )
+    return hashlib.md5(
+        orjson.dumps(items), usedforsecurity=False
+    ).hexdigest()
+
+
 async def _upsert_snapshot_rows(rows: list[dict]):
     if not rows:
         return
 
-    await database.execute_many(_UPSERT_ACCOUNT_MAGNET_QUERY, rows)
+    # A multi-row INSERT ... ON CONFLICT cannot affect the same conflict target
+    # twice; magnet_id is the per-account discriminator, so dedupe on it (keep last).
+    deduped: dict = {}
+    for row in rows:
+        deduped[row["magnet_id"]] = row
+    rows = list(deduped.values())
+
+    for start in range(0, len(rows), _MAGNET_INSERT_CHUNK):
+        chunk = rows[start : start + _MAGNET_INSERT_CHUNK]
+        params = {}
+        for i, row in enumerate(chunk):
+            for col in _MAGNET_INSERT_COLUMNS:
+                params[f"{col}_{i}"] = row[col]
+        await database.execute(_multi_row_magnet_sql(len(chunk)), params)
+
+
+async def _touch_snapshot(
+    service: str, account_key_hash: str, synced_at: float
+) -> bool:
+    """Refresh the per-row synced_at watermark for an unchanged snapshot in one
+    bulk UPDATE, instead of re-upserting every magnet. Returns True only if rows
+    were actually updated, so the caller can fall back to a full upsert when the
+    durable rows are gone (e.g. cleaned up while the Redis fingerprint survived)."""
+    row = await database.fetch_one(
+        _TOUCH_SNAPSHOT_QUERY,
+        {
+            "debrid_service": service,
+            "account_key_hash": account_key_hash,
+            "synced_at": synced_at,
+        },
+    )
+    return row is not None
 
 
 async def _set_last_sync(service: str, account_key_hash: str, last_sync: float):
@@ -208,20 +291,44 @@ async def _sync_single_account(
             }
         )
 
-    await _upsert_snapshot_rows(rows)
+    # Coalesce the durable write through Redis. The full snapshot is re-upserted
+    # on every sync, but the account's magnet set is usually unchanged — in that
+    # case re-writing every row (only to bump synced_at) is wasted DB work. When
+    # the fingerprint matches the last sync, refresh the synced_at watermark with a
+    # single bulk UPDATE and skip the per-magnet upsert + stale GC entirely. This
+    # collapsed the ~496M individual upsert calls that were churning the table.
+    fingerprint = _snapshot_fingerprint(rows)
+    prev_fingerprint = await redis_get_account_snapshot_fp(service, account_key_hash)
 
-    await database.execute(
-        """
-        DELETE FROM debrid_account_magnets
-        WHERE debrid_service = :debrid_service
-          AND account_key_hash = :account_key_hash
-          AND synced_at < :synced_at
-        """,
-        {
-            "debrid_service": service,
-            "account_key_hash": account_key_hash,
-            "synced_at": synced_at,
-        },
+    coalesced = False
+    if rows and prev_fingerprint is not None and prev_fingerprint == fingerprint:
+        # Unchanged set: just bump the watermark. _touch_snapshot returns False if
+        # no rows exist (durable copy was cleaned up while the fingerprint lived),
+        # in which case we fall through to a full upsert to self-heal.
+        coalesced = await _touch_snapshot(service, account_key_hash, synced_at)
+
+    if not coalesced:
+        await _upsert_snapshot_rows(rows)
+
+        await database.execute(
+            """
+            DELETE FROM debrid_account_magnets
+            WHERE debrid_service = :debrid_service
+              AND account_key_hash = :account_key_hash
+              AND synced_at < :synced_at
+            """,
+            {
+                "debrid_service": service,
+                "account_key_hash": account_key_hash,
+                "synced_at": synced_at,
+            },
+        )
+
+    # Record the fingerprint only after a successful DB write, so a matching
+    # fingerprint always implies the durable rows are present. Refreshed on both
+    # paths to keep it alive while the account is actively synced.
+    await redis_set_account_snapshot_fp(
+        service, account_key_hash, fingerprint, _debrid_account_snapshot_ttl() * 2
     )
 
     await _set_last_sync(service, account_key_hash, synced_at)

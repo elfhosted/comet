@@ -16,6 +16,8 @@ FIRST_SEARCH_PREFIX = "comet:fs:"
 FRESH_TORRENT_PREFIX = "comet:ft:"
 METADATA_CACHE_PREFIX = "comet:mc:"
 CREDENTIAL_VALIDATION_PREFIX = "comet:cv:"
+DEBRID_DB_MARKER_PREFIX = "comet:ddm:"
+ACCOUNT_SNAPSHOT_FP_PREFIX = "comet:asfp:"
 DEFAULT_TTL = 300
 
 
@@ -368,6 +370,86 @@ async def redis_set_debrid_availability(
             }
             pipe.set(key, orjson.dumps(entry), ex=ttl)
         await pipe.execute()
+    except Exception:
+        pass
+
+
+def _debrid_db_marker_key(debrid_service: str, season_norm, episode_norm, info_hash: str):
+    return f"{DEBRID_DB_MARKER_PREFIX}{debrid_service}:{season_norm}:{episode_norm}:{info_hash}"
+
+
+async def redis_filter_debrid_db_writes(debrid_service: str, keys: list):
+    """Coalesce durable DB writes for debrid availability (read-only).
+
+    ``keys`` is a list of ``(season_norm, episode_norm, info_hash)`` tuples. Returns
+    the subset whose durable DB row has NOT been refreshed within the marker TTL.
+    Markers are NOT set here — the caller records them via
+    ``redis_mark_debrid_db_written`` only after the DB write succeeds, so a failed
+    write is retried rather than silently suppressed. Returns ``None`` if Redis is
+    unavailable, signalling the caller to persist everything (DB-only behaviour).
+    """
+    if not _redis:
+        return None
+    try:
+        if not keys:
+            return []
+        marker_keys = [
+            _debrid_db_marker_key(debrid_service, s, e, ih) for (s, e, ih) in keys
+        ]
+        existing = await _redis.mget(*marker_keys)
+        return [tup for tup, cur in zip(keys, existing) if cur is None]
+    except Exception:
+        return None
+
+
+async def redis_mark_debrid_db_written(debrid_service: str, keys: list, interval: int):
+    """Record that the given keys were just persisted to the durable DB, so repeat
+    requests skip the write for ``interval`` seconds. Best-effort; called after a
+    successful DB write."""
+    if not _redis or not keys:
+        return
+    try:
+        pipe = _redis.pipeline()
+        for (s, e, ih) in keys:
+            pipe.set(_debrid_db_marker_key(debrid_service, s, e, ih), b"1", ex=interval)
+        await pipe.execute()
+    except Exception:
+        pass
+
+
+# --- Debrid Account Snapshot Fingerprint via Redis ---
+
+def _account_snapshot_fp_key(debrid_service: str, account_key_hash: str):
+    return f"{ACCOUNT_SNAPSHOT_FP_PREFIX}{debrid_service}:{account_key_hash}"
+
+
+async def redis_get_account_snapshot_fp(debrid_service: str, account_key_hash: str):
+    """Return the fingerprint of the account's last-synced magnet set, or None."""
+    if not _redis:
+        return None
+    try:
+        data = await _redis.get(_account_snapshot_fp_key(debrid_service, account_key_hash))
+        if data is not None:
+            return data.decode() if isinstance(data, (bytes, bytearray)) else data
+    except Exception:
+        pass
+    return None
+
+
+async def redis_set_account_snapshot_fp(
+    debrid_service: str, account_key_hash: str, fingerprint: str, ttl: int
+):
+    """Store the fingerprint of the account's just-synced magnet set. Best-effort;
+    called only after a successful DB write so a matching fingerprint always implies
+    the durable rows are present."""
+    if not _redis:
+        return
+    try:
+        await _redis.set(
+            _account_snapshot_fp_key(debrid_service, account_key_hash),
+            fingerprint.encode(),
+            ex=ttl if ttl and ttl > 0 else None,
+        )
     except Exception:
         pass
 
