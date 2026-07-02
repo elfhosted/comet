@@ -1,3 +1,4 @@
+import re
 from collections import OrderedDict, defaultdict
 from threading import Event, Lock
 
@@ -21,6 +22,20 @@ else:
 
 def quick_alias_match(text_normalized: str, ez_aliases_normalized: list[str]):
     return any(alias in text_normalized for alias in ez_aliases_normalized)
+
+
+# Site watermarks like "From [ WWW.TORRENTING.ME ] - Show.S04E10..." make RTN
+# truncate title extraction at the bracketed site tag, so the watermark word
+# "From" parses as the release title and false-matches media titled "From".
+# The bracketed token must start with "www." so bracketed title fragments
+# (e.g. "From [Dusk.Till.Dawn] 1996") are never stripped.
+_SITE_WATERMARK = re.compile(
+    r"(?i)^from\s+\[\s*www\.[a-z0-9-]+(?:\.[a-z0-9-]+)+\s*\]\s*-?\s*"
+)
+
+
+def strip_site_watermark(torrent_title: str) -> str:
+    return _SITE_WATERMARK.sub("", torrent_title) or torrent_title
 
 
 def scrub(t: str):
@@ -213,9 +228,11 @@ def filter_worker(
             _log_exclusion(f"🚫 Rejected (Sample/Empty) | {torrent_title}")
             continue
 
+        parse_title = strip_site_watermark(torrent_title)
+
         # temp fix while waiting for RTN to fix their parsing
         try:
-            parsed = _parse_with_cache(torrent_title)
+            parsed = _parse_with_cache(parse_title)
         except ValidationError:
             _log_exclusion(f"❌ Rejected (Parse Error) | {torrent_title}")
             continue
@@ -250,7 +267,7 @@ def filter_worker(
             continue
 
         alias_matched = ez_aliases_normalized and quick_alias_match(
-            scrub(torrent_title), ez_aliases_normalized
+            scrub(parse_title), ez_aliases_normalized
         )
         if not alias_matched:
             if not title_match(title, parsed.parsed_title, aliases=aliases):
