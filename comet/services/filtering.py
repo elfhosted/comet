@@ -266,15 +266,16 @@ def filter_worker(
             _log_exclusion(f"❌ Rejected (No Parsed Title) | {torrent_title}")
             continue
 
-        alias_matched = ez_aliases_normalized and quick_alias_match(
-            scrub(parse_title), ez_aliases_normalized
-        )
-        if not alias_matched:
-            if not title_match(title, parsed.parsed_title, aliases=aliases):
-                _log_exclusion(
-                    f"❌ Rejected (Title Mismatch) | {torrent_title} | Parsed: {parsed.parsed_title} | Expected: {title}"
-                )
-                continue
+        # No quick_alias_match() substring bypass here: a short alias like
+        # "Help" (working title of Strung 2026) is a substring of any release
+        # containing that word (Send.Help.2026, Help.1965, ...) and would skip
+        # title matching entirely. title_match() already fuzzy-compares the
+        # parsed title against every alias.
+        if not title_match(title, parsed.parsed_title, aliases=aliases):
+            _log_exclusion(
+                f"❌ Rejected (Title Mismatch) | {torrent_title} | Parsed: {parsed.parsed_title} | Expected: {title}"
+            )
+            continue
 
         if year and parsed.year:
             if not (min_year <= parsed.year <= max_year):
